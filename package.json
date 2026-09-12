@@ -1,0 +1,17 @@
+{
+  "name": "ricehacks-presence-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Tiny WebSocket relay that shares each connected player's live position with everyone else.",
+  "scripts": {
+    "start": "node server.mjs",
+    "walker": "node fake-walker.mjs"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
