@@ -5,7 +5,8 @@ import { accountFor } from './auth.mjs';
 import { allowToken, coachConfigured, mintConversationToken } from './coach.mjs';
 import {
   HttpError, buyItem, claimUsername, equipItem, getProfile, globalLeaderboard, hasDb, listFriends, listNotifications,
-  markNotificationsRead, personalRecord, respondFriendRequest, scoreTargets, sendFriendRequest, setAppearance,
+  markNotificationsRead, personalRecord, recentWorkouts, respondFriendRequest, scoreTargets, sendFriendRequest,
+  setAppearance,
 } from './db.mjs';
 import { COSMETICS, DURATIONS, SKIN_TONES, USERNAME_RE } from './game-config.mjs';
 
@@ -153,6 +154,8 @@ export function createApi(live) {
     },
 
     'GET /api/leaderboard': async ({ uid }) => globalLeaderboard(uid),
+
+    'GET /api/workouts': async ({ uid }) => recentWorkouts(uid),
 
     'GET /api/pr': async ({ uid, url }) => {
       const { exercise, durationS } = setOf(url);

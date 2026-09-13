@@ -197,6 +197,20 @@ check('B balance 20 + 58 = 78, 1W 1L', meB.bp === 78 && meB.wins === 1 && meB.lo
 const pr = (await A.api('GET', '/api/pr?exercise=squat&durationS=15')).body;
 check('personal record = best of solo and battles', pr?.bestScore === 150 && pr.bestReps === 15, JSON.stringify(pr));
 
+// Workout history, newest first, from my side of each row
+const histA = (await A.api('GET', '/api/workouts')).body;
+const histB = (await B.api('GET', '/api/workouts')).body;
+const brief = (h) => JSON.stringify(h?.map((w) => [w.mode, w.score, w.result, w.opponent?.name, w.bp, w.forfeit]));
+check('history A: forfeit loss, win vs B, solo 150, early solo',
+  histA?.length === 4
+  && histA[0].result === 'loss' && histA[0].forfeit && histA[0].opponent?.name === nameB
+  && histA[1].result === 'win' && histA[1].score === 50 && histA[1].opponent?.score === 20 && histA[1].bp === 100
+  && histA[2].mode === 'solo' && histA[2].score === 150 && histA[2].bp === 150 && histA[2].opponent === null && histA[2].result === null
+  && histA[3].mode === 'solo' && histA[3].bp === 0, brief(histA));
+check('history B: forfeit win, loss vs A (scores from B side)',
+  histB?.length === 2 && histB[0].result === 'win' && histB[0].bp === 58
+  && histB[1].result === 'loss' && histB[1].score === 20 && histB[1].opponent?.name === nameA && histB[1].opponent.score === 50, brief(histB));
+
 // Global leaderboard: best single set per person; people without sets are listed last
 const board = (await A.api('GET', '/api/leaderboard')).body;
 const row = (n) => board?.entries?.find((e) => e.username === n);

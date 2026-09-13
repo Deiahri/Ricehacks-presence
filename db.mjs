@@ -423,6 +423,33 @@ export async function personalRecord(uid, exercise, durationS) {
   return { bestScore: rows[0].best_score, bestReps: rows[0].best_reps };
 }
 
+/**
+ * My latest sets, newest first, seen from my side of the row: { id, createdAt, mode, exercise, durationS, score, reps,
+ * bp, forfeit, opponent: { name, score } | null, result: 'win' | 'loss' | 'draw' | null (solo) }.
+ */
+export async function recentWorkouts(uid, limit = 10) {
+  const { rows } = await q(
+    `SELECT id, created_at, mode, exercise, duration_s, forfeit, winner_uid,
+       CASE WHEN user_uid = $1 THEN score          ELSE opponent_score END AS my_score,
+       CASE WHEN user_uid = $1 THEN reps           ELSE opponent_reps  END AS my_reps,
+       CASE WHEN user_uid = $1 THEN user_bp        ELSE opponent_bp    END AS my_bp,
+       CASE WHEN user_uid = $1 THEN opponent_name  ELSE user_name      END AS their_name,
+       CASE WHEN user_uid = $1 THEN opponent_score ELSE score          END AS their_score
+     FROM workouts WHERE user_uid = $1 OR opponent_uid = $1
+     ORDER BY created_at DESC LIMIT $2`,
+    [uid, limit],
+  );
+  return rows.map((r) => {
+    const battle = r.mode === 'challenge';
+    return {
+      id: r.id, createdAt: r.created_at, mode: r.mode, exercise: r.exercise, durationS: r.duration_s,
+      score: r.my_score, reps: r.my_reps, bp: r.my_bp ?? 0, forfeit: r.forfeit,
+      opponent: battle ? { name: r.their_name, score: r.their_score } : null,
+      result: !battle ? null : r.winner_uid === null ? 'draw' : r.winner_uid === uid ? 'win' : 'loss',
+    };
+  });
+}
+
 /** Every stored set as (uid, score, reps, exercise, duration_s, created_at), from either side of a battle. */
 const ALL_SETS = `
   SELECT user_uid AS uid, score, reps, exercise, duration_s, created_at FROM workouts WHERE user_uid IS NOT NULL
