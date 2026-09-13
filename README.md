@@ -108,13 +108,14 @@ On the free tier the service sleeps after about 15 minutes without traffic. The 
 | client → server | `{"type":"hello","id","userId","name","shirt","token"?}` once per connection. `id` is per tab; `userId` is stable per device; `token` is the Clerk session token (required for an account when Clerk is on) |
 | client → server | `{"type":"pos","lat","lng","heading"(deg or null),"acc"}`, at most 4×/s, and every 20 s while still |
 | client → server | `{"type":"status","busy"}`: in a solo workout, so challenges are refused |
+| client → server | `{"type":"chat","text"}`: say something on the map. Clamped to 60 characters, one per 1.5 s per player, and cleared after 7 s. Never stored |
 | server → client | `{"type":"you","id"}` after hello |
 | server → client | `{"type":"profile","profile":{username,shirt,skin,bp,level,wins,losses,equipped,owned}}` after hello, and whenever BP, looks, gear or the username changes |
 | server → client | `{"type":"friend_request"}` / `{"type":"friend_update"}`: refetch `/api/friends` |
 | server → client | `{"type":"notification","notification":{id,type,createdAt,read,actor}}`: someone accepted or declined your friend request (also in `/api/notifications`) |
-| server → client | `{"type":"players","players":[{id,name,username,shirt,skin,equipped,lat,lng,heading,acc,ts,busy}]}`, up to 5×/s, only when something changed |
+| server → client | `{"type":"players","players":[{id,name,username,shirt,skin,equipped,lat,lng,heading,acc,ts,busy,chat,chatAt}]}`, up to 5×/s, only when something changed. `chat` is what that player just said, or null |
 
-Players disappear from the map after 60 s without a position, and are removed when their socket closes. A ping every 25 s drops dead sockets.
+Players disappear from the map after 60 s without a position, and are removed when their socket closes. A chat bubble expires the same way: the sweep clears it 7 s after it was sent, which marks the snapshot dirty. A ping every 25 s drops dead sockets.
 
 ### Battles
 

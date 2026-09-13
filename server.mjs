@@ -18,6 +18,10 @@ const BROADCAST_MS = 200; // snapshot at most 5×/s, only when something changed
 const STALE_MS = 60_000; // hide players from the map that stop sending positions
 const HEARTBEAT_MS = 25_000; // ping to detect dead sockets + keep proxies from idling us out
 
+const CHAT_MS = 7_000; // how long a chat bubble stays over a player's head
+const CHAT_COOLDOWN_MS = 1_500; // one message per player per 1.5 s
+const CHAT_MAX = 60; // characters in a bubble
+
 const REQUEST_TIMEOUT_MS = 30_000; // unanswered challenge request
 const PICK_TIMEOUT_MS = 90_000; // both must lock in exercise + duration
 const READY_TIMEOUT_MS = 60_000; // both cameras must be running
@@ -31,7 +35,7 @@ const QUALITIES = new Set(['red', 'yellow', 'green']);
  * `userId` is the account's stable key (Clerk user id, or the device secret without Clerk; never sent to other clients);
  * until the account resolves it is the device secret or connection id. `uid` is the account, filled in once the
  * database answers. `soloSince` = when the current solo workout began.
- * @type {Map<import('ws').WebSocket, {id:string,userId:string,uid:string|null,username:string|null,name:string,shirt:string,skin:string|null,equipped:object,verified:boolean|null,lat:number|null,lng:number|null,heading:number|null,acc:number|null,ts:number,soloBusy:boolean,soloSince:number|null}>}
+ * @type {Map<import('ws').WebSocket, {id:string,userId:string,uid:string|null,username:string|null,name:string,shirt:string,skin:string|null,equipped:object,verified:boolean|null,lat:number|null,lng:number|null,heading:number|null,acc:number|null,ts:number,soloBusy:boolean,soloSince:number|null,chat:string|null,chatAt:number}>}
  */
 const players = new Map();
 /** Active challenge per socket (both participants point at the same object). */
@@ -466,6 +470,8 @@ wss.on('connection', (ws) => {
         ts: Date.now(),
         soloBusy: prev?.soloBusy ?? false,
         soloSince: prev?.soloSince ?? null,
+        chat: prev?.chat ?? null,
+        chatAt: prev?.chatAt ?? 0,
       };
       players.set(ws, entry);
       ws.send(JSON.stringify({ type: 'you', id: msg.id }));
@@ -497,6 +503,18 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // Say something: a bubble over my head on everyone's map for CHAT_MS. Ephemeral, like a position.
+    if (msg.type === 'chat') {
+      if (typeof msg.text !== 'string') return;
+      const text = msg.text.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, CHAT_MAX);
+      const now = Date.now();
+      if (!text || now - me.chatAt < CHAT_COOLDOWN_MS) return;
+      me.chat = text;
+      me.chatAt = now;
+      dirty = true;
+      return;
+    }
+
     if (msg.type === 'solo_result') return onSoloResult(ws, me, msg);
     if (typeof msg.type === 'string' && msg.type.startsWith('challenge_')) onChallenge(ws, me, msg);
   });
@@ -516,6 +534,7 @@ setInterval(() => {
   const now = Date.now();
   for (const p of players.values()) {
     if (p.lat !== null && now - p.ts > STALE_MS) { p.lat = p.lng = null; dirty = true; }
+    if (p.chat !== null && now - p.chatAt > CHAT_MS) { p.chat = null; dirty = true; } // the bubble times out
   }
   if (!dirty) return;
   dirty = false;
@@ -526,6 +545,7 @@ setInterval(() => {
       id: p.id, name: p.name, username: p.username, shirt: p.shirt, skin: p.skin, equipped: p.equipped, verified: p.verified,
       lat: p.lat, lng: p.lng, heading: p.heading, acc: p.acc, ts: p.ts,
       busy: p.soloBusy || challengeOf.has(ws),
+      chat: p.chat, chatAt: p.chatAt,
     });
   }
   const payload = JSON.stringify({ type: 'players', players: list });
