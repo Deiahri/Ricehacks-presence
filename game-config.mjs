@@ -23,10 +23,28 @@ export const COSMETICS = {
 /** Wear an item as soon as it's bought. */
 export const AUTO_EQUIP_ON_BUY = true;
 
+/**
+ * Battles are an HP duel: each fighter starts with HP_PER_SECOND × set length, and every rep hits the other for its
+ * points (form / 10). Most damage dealt wins. Worn items change the damage (see battle-effects.mjs):
+ *   shield   — takes `absorb` off every hit you receive
+ *   gauntlet — your hits are × damageMult
+ *   hat      — each of the foe's reps under `curseBelow` has `curseChance` to deal `curseDamage` instead (it heals you)
+ *   wand     — `streak` reps in a row at `perfectAt`+ form pays `surgeBp` extra BP at the end, once per battle
+ * Items only change who wins; BP stays score-based (plus the wand surge).
+ */
+export const HP_PER_SECOND = 5;
+export const ITEM_EFFECTS = {
+  low_tier_shield: { absorb: 0.3 },
+  gauntlet: { damageMult: 1.5 },
+  warlock_hat: { curseChance: 0.2, curseBelow: 50, curseDamage: -1 },
+  magic_wand: { perfectAt: 90, streak: 5, surgeBp: 50 },
+};
+
 /** Skin tone ids the avatar editor offers (free to change). The colours live in the app's src/config/appearance.ts. */
 export const SKIN_TONES = new Set(['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8']);
 
 export const soloBp = (score) => Math.max(0, Math.round(score * REWARDS.soloPerScorePoint));
-/** outcome: 'win' | 'loss' | 'draw'. */
-export const battleBp = (score, outcome, forfeited) => (forfeited ? REWARDS.forfeit : Math.max(0, score) + REWARDS[outcome]);
+/** outcome: 'win' | 'loss' | 'draw'. `surge` = the magic wand fired this battle. */
+export const battleBp = (score, outcome, forfeited, surge = false) =>
+  forfeited ? REWARDS.forfeit : Math.max(0, score) + REWARDS[outcome] + (surge ? ITEM_EFFECTS.magic_wand.surgeBp : 0);
 export const levelFor = (earned) => 1 + Math.floor(Math.max(0, earned) / BP_PER_LEVEL);

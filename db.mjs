@@ -105,14 +105,70 @@ CREATE TABLE IF NOT EXISTS notifications (
   read_at    timestamptz
 );
 CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications (user_id, created_at DESC);
+
+-- Replays. rep_detail = [{ t (s into the set), s (form), d (rep seconds), sub {name: 0-100}, c [cues] }] per side.
+-- battle_detail = the HP duel as settled: { hpMax, user: SideOut, opponent: SideOut } (see battle-effects.mjs).
+ALTER TABLE workouts
+  ADD COLUMN IF NOT EXISTS rep_detail          jsonb,
+  ADD COLUMN IF NOT EXISTS opponent_rep_scores real[],
+  ADD COLUMN IF NOT EXISTS opponent_rep_detail jsonb,
+  ADD COLUMN IF NOT EXISTS opponent_avg_form   real,
+  ADD COLUMN IF NOT EXISTS battle_detail       jsonb;
+
+-- Pose track per side: a fixed-rate grid of frames, each joints × (x, y) bytes (0-254 across the image, 255 = unseen).
+CREATE TABLE IF NOT EXISTS workout_tracks (
+  workout_id uuid NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
+  side       text NOT NULL CHECK (side IN ('user', 'opponent')),
+  fps        smallint NOT NULL,
+  joints     smallint NOT NULL,
+  aspect     real NOT NULL,
+  mirrored   boolean NOT NULL,
+  frames     bytea NOT NULL,
+  PRIMARY KEY (workout_id, side)
+);
+
+-- AI coaching, cached. Advice is per viewer, since a battle row is seen from two sides.
+CREATE TABLE IF NOT EXISTS workout_insights (
+  workout_id uuid NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
+  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  advice     jsonb NOT NULL,
+  model      text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (workout_id, user_id)
+);
+-- The "how you've been doing" recap: valid while my latest workout and count are unchanged.
+CREATE TABLE IF NOT EXISTS user_recaps (
+  user_id           uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  latest_workout_id uuid,
+  workout_count     integer NOT NULL,
+  recap             jsonb NOT NULL,
+  model             text NOT NULL,
+  created_at        timestamptz NOT NULL DEFAULT now()
+);
 `;
 
 const COLUMNS = [
-  'mode', 'exercise', 'duration_s', 'user_id', 'user_name', 'score', 'reps', 'avg_form', 'rep_scores',
+  'id', 'mode', 'exercise', 'duration_s', 'user_id', 'user_name', 'score', 'reps', 'avg_form', 'rep_scores',
   'challenge_id', 'opponent_id', 'opponent_name', 'opponent_score', 'opponent_reps', 'winner_id', 'forfeit',
   'user_uid', 'opponent_uid', 'winner_uid', 'user_bp', 'opponent_bp',
+  'rep_detail', 'opponent_rep_scores', 'opponent_rep_detail', 'opponent_avg_form', 'battle_detail',
 ];
-const INSERT = `INSERT INTO workouts (${COLUMNS.join(', ')}) VALUES (${COLUMNS.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING id`;
+/** pg sends JS arrays as Postgres arrays, so jsonb values go over as JSON text. */
+const JSONB = new Set(['rep_detail', 'opponent_rep_detail', 'battle_detail']);
+const INSERT = `INSERT INTO workouts (${COLUMNS.join(', ')}) VALUES (${
+  COLUMNS.map((k, i) => (k === 'id' ? `COALESCE($${i + 1}::uuid, gen_random_uuid())` : `$${i + 1}`)).join(', ')}) RETURNING id`;
+const insertParams = (row) => COLUMNS.map((k) => (JSONB.has(k) ? (row[k] == null ? null : JSON.stringify(row[k])) : row[k] ?? null));
+
+/** Store pose tracks for a workout: [{ side, fps, joints, aspect, mirrored, frames: Buffer }] (nulls skipped). */
+async function insertTracks(c, workoutId, tracks) {
+  for (const t of tracks) {
+    if (!t) continue;
+    await c.query(
+      'INSERT INTO workout_tracks (workout_id, side, fps, joints, aspect, mirrored, frames) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [workoutId, t.side, t.fps, t.joints, t.aspect, t.mirrored, t.frames],
+    );
+  }
+}
 
 /** An error the HTTP layer turns into a status code and a short machine-readable reason. */
 export class HttpError extends Error {
@@ -430,12 +486,15 @@ export async function personalRecord(uid, exercise, durationS) {
 export async function recentWorkouts(uid, limit = 10) {
   const { rows } = await q(
     `SELECT id, created_at, mode, exercise, duration_s, forfeit, winner_uid,
-       CASE WHEN user_uid = $1 THEN score          ELSE opponent_score END AS my_score,
-       CASE WHEN user_uid = $1 THEN reps           ELSE opponent_reps  END AS my_reps,
-       CASE WHEN user_uid = $1 THEN user_bp        ELSE opponent_bp    END AS my_bp,
-       CASE WHEN user_uid = $1 THEN opponent_name  ELSE user_name      END AS their_name,
-       CASE WHEN user_uid = $1 THEN opponent_score ELSE score          END AS their_score
-     FROM workouts WHERE user_uid = $1 OR opponent_uid = $1
+       CASE WHEN user_uid = $1 THEN score          ELSE opponent_score    END AS my_score,
+       CASE WHEN user_uid = $1 THEN reps           ELSE opponent_reps     END AS my_reps,
+       CASE WHEN user_uid = $1 THEN avg_form       ELSE opponent_avg_form END AS my_avg,
+       CASE WHEN user_uid = $1 THEN user_bp        ELSE opponent_bp       END AS my_bp,
+       CASE WHEN user_uid = $1 THEN opponent_name  ELSE user_name         END AS their_name,
+       CASE WHEN user_uid = $1 THEN opponent_score ELSE score             END AS their_score,
+       EXISTS (SELECT 1 FROM workout_tracks t WHERE t.workout_id = w.id
+               AND t.side = CASE WHEN w.user_uid = $1 THEN 'user' ELSE 'opponent' END) AS has_replay
+     FROM workouts w WHERE user_uid = $1 OR opponent_uid = $1
      ORDER BY created_at DESC LIMIT $2`,
     [uid, limit],
   );
@@ -443,11 +502,106 @@ export async function recentWorkouts(uid, limit = 10) {
     const battle = r.mode === 'challenge';
     return {
       id: r.id, createdAt: r.created_at, mode: r.mode, exercise: r.exercise, durationS: r.duration_s,
-      score: r.my_score, reps: r.my_reps, bp: r.my_bp ?? 0, forfeit: r.forfeit,
+      score: r.my_score, reps: r.my_reps, avgForm: r.my_avg, bp: r.my_bp ?? 0, forfeit: r.forfeit,
       opponent: battle ? { name: r.their_name, score: r.their_score } : null,
-      result: !battle ? null : r.winner_uid === null ? 'draw' : r.winner_uid === uid ? 'win' : 'loss',
+      result: resultFor(r, uid),
+      hasReplay: r.has_replay,
     };
   });
+}
+
+const resultFor = (r, uid) =>
+  r.mode !== 'challenge' ? null : r.winner_uid === null ? 'draw' : r.winner_uid === uid ? 'win' : 'loss';
+
+/**
+ * One workout, seen from my side: summary, both sides' reps (form scores + detail), the HP duel and my pose track.
+ * 404 unless I took part. The opponent's pose track is never sent.
+ */
+export async function workoutDetail(uid, id) {
+  const { rows } = await q('SELECT * FROM workouts WHERE id = $1 AND (user_uid = $2 OR opponent_uid = $2)', [id, uid]);
+  const w = rows[0];
+  if (!w) throw new HttpError(404, 'no-workout');
+  const mine = w.user_uid === uid ? 'user' : 'opponent';
+  const theirs = mine === 'user' ? 'opponent' : 'user';
+  const sideOf = (s) => (s === 'user'
+    ? { name: w.user_name, score: w.score, reps: w.reps, avgForm: w.avg_form, repScores: w.rep_scores ?? [], repDetail: w.rep_detail ?? [], bp: w.user_bp ?? 0 }
+    : { name: w.opponent_name, score: w.opponent_score, reps: w.opponent_reps, avgForm: w.opponent_avg_form,
+        repScores: w.opponent_rep_scores ?? [], repDetail: w.opponent_rep_detail ?? [], bp: w.opponent_bp ?? 0 });
+  const track = (await q('SELECT fps, joints, aspect, mirrored, frames FROM workout_tracks WHERE workout_id = $1 AND side = $2', [id, mine])).rows[0];
+  const bd = w.battle_detail;
+  return {
+    id: w.id, createdAt: w.created_at, mode: w.mode, exercise: w.exercise, durationS: w.duration_s, forfeit: w.forfeit,
+    result: resultFor(w, uid),
+    me: sideOf(mine),
+    opponent: w.mode === 'challenge' ? sideOf(theirs) : null,
+    battle: bd ? { hpMax: bd.hpMax, you: bd[mine], opponent: bd[theirs] } : null,
+    track: track
+      ? { v: 1, fps: track.fps, joints: track.joints, aspect: track.aspect, mirrored: track.mirrored, frames: track.frames.toString('base64') }
+      : null,
+  };
+}
+
+/**
+ * My sets, oldest first (the latest `limit`), for trend charts: { id, createdAt, mode, exercise, durationS, score,
+ * reps, avgForm, result }. exercise / durationS null = any.
+ */
+export async function workoutSeries(uid, exercise = null, durationS = null, limit = 30) {
+  const { rows } = await q(
+    `SELECT * FROM (
+       SELECT id, created_at, mode, exercise, duration_s, winner_uid,
+         CASE WHEN user_uid = $1 THEN score    ELSE opponent_score    END AS my_score,
+         CASE WHEN user_uid = $1 THEN reps     ELSE opponent_reps     END AS my_reps,
+         CASE WHEN user_uid = $1 THEN avg_form ELSE opponent_avg_form END AS my_avg
+       FROM workouts
+       WHERE (user_uid = $1 OR opponent_uid = $1) AND ($2::text IS NULL OR exercise = $2) AND ($3::int IS NULL OR duration_s = $3)
+       ORDER BY created_at DESC LIMIT $4
+     ) t ORDER BY created_at`,
+    [uid, exercise, durationS, limit],
+  );
+  return rows.map((r) => ({
+    id: r.id, createdAt: r.created_at, mode: r.mode, exercise: r.exercise, durationS: r.duration_s,
+    score: r.my_score, reps: r.my_reps, avgForm: r.my_avg, result: resultFor(r, uid),
+  }));
+}
+
+/** How many workouts I have and the newest one's id (a recap stays valid while these don't change). */
+export async function workoutStats(uid) {
+  const { rows } = await q(
+    `SELECT count(*)::int AS n, (array_agg(id ORDER BY created_at DESC))[1] AS latest
+     FROM workouts WHERE user_uid = $1 OR opponent_uid = $1`,
+    [uid],
+  );
+  return { count: rows[0].n, latestId: rows[0].latest ?? null };
+}
+
+// --- AI insight caches ----------------------------------------------------------
+
+export async function getInsight(workoutId, uid) {
+  const { rows } = await q('SELECT advice FROM workout_insights WHERE workout_id = $1 AND user_id = $2', [workoutId, uid]);
+  return rows[0]?.advice ?? null;
+}
+
+export async function putInsight(workoutId, uid, advice, model) {
+  await q(
+    'INSERT INTO workout_insights (workout_id, user_id, advice, model) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+    [workoutId, uid, JSON.stringify(advice), model],
+  );
+}
+
+/** { latestId, count, recap, createdAt } or null. */
+export async function getRecap(uid) {
+  const { rows } = await q('SELECT latest_workout_id, workout_count, recap, created_at FROM user_recaps WHERE user_id = $1', [uid]);
+  const r = rows[0];
+  return r ? { latestId: r.latest_workout_id, count: r.workout_count, recap: r.recap, createdAt: r.created_at } : null;
+}
+
+export async function putRecap(uid, { latestId, count }, recap, model) {
+  await q(
+    `INSERT INTO user_recaps (user_id, latest_workout_id, workout_count, recap, model) VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (user_id) DO UPDATE SET latest_workout_id = EXCLUDED.latest_workout_id, workout_count = EXCLUDED.workout_count,
+       recap = EXCLUDED.recap, model = EXCLUDED.model, created_at = now()`,
+    [uid, latestId, count, JSON.stringify(recap), model],
+  );
 }
 
 /** Every stored set as (uid, score, reps, exercise, duration_s, created_at), from either side of a battle. */
@@ -526,38 +680,43 @@ async function award(c, uid, delta, reason, ref) {
 }
 
 /**
- * Store a solo set and pay its BP (when `earn`). Resolves { stored, bpAwarded, bp }.
- * Without a database the set is only logged.
+ * Store a solo set (with its rep detail and pose track, when valid) and pay its BP (when `earn`).
+ * Resolves { stored, bpAwarded, bp, workoutId }. Without a database the set is only logged.
  */
-export async function recordSolo({ uid, secret, name, exercise, durationS, scores, score, avgForm, earn }) {
+export async function recordSolo({ uid, secret, name, exercise, durationS, scores, score, avgForm, earn, detail = null, track = null }) {
   const bpAwarded = uid && earn ? soloBp(score) : 0;
   if (!pool) {
     console.log(`[db] skipped solo ${exercise} ${durationS}s score=${score} reps=${scores.length}`);
-    return { stored: false, bpAwarded: 0, bp: null };
+    return { stored: false, bpAwarded: 0, bp: null, workoutId: null };
   }
   return withTx(async (c) => {
     const row = {
       mode: 'solo', exercise, duration_s: durationS, user_id: secret, user_name: name, score, reps: scores.length,
-      avg_form: avgForm, rep_scores: scores, forfeit: false, user_uid: uid, user_bp: bpAwarded,
+      avg_form: avgForm, rep_scores: scores, forfeit: false, user_uid: uid, user_bp: bpAwarded, rep_detail: detail,
     };
-    const { rows } = await c.query(INSERT, COLUMNS.map((k) => row[k] ?? null));
+    const { rows } = await c.query(INSERT, insertParams(row));
+    const workoutId = rows[0].id;
+    await insertTracks(c, workoutId, [track && { ...track, side: 'user' }]);
     let bp = null;
-    if (uid && bpAwarded > 0) bp = await award(c, uid, bpAwarded, 'solo', rows[0].id);
-    return { stored: true, bpAwarded, bp };
+    if (uid && bpAwarded > 0) bp = await award(c, uid, bpAwarded, 'solo', workoutId);
+    return { stored: true, bpAwarded, bp, workoutId };
   });
 }
 
 /**
- * Store a finished battle (one row) and pay both sides. `sides` = [{ uid, bpAwarded }] for the user and opponent.
+ * Store a finished battle (one row, `row.id` chosen by the caller) and pay both sides.
+ * `sides` = [{ uid, bpAwarded }] for the user and opponent; `tracks` = [userTrack, opponentTrack] (either may be null).
  * Resolves true when stored.
  */
-export async function recordChallenge(row, sides) {
+export async function recordChallenge(row, sides, tracks = []) {
   if (!pool) {
     console.log(`[db] skipped challenge ${row.exercise} ${row.duration_s}s ${row.score}-${row.opponent_score}`);
     return false;
   }
   await withTx(async (c) => {
-    await c.query(INSERT, COLUMNS.map((k) => row[k] ?? null));
+    const { rows } = await c.query(INSERT, insertParams(row));
+    const [user, opponent] = tracks;
+    await insertTracks(c, rows[0].id, [user && { ...user, side: 'user' }, opponent && { ...opponent, side: 'opponent' }]);
     for (const s of sides) if (s.uid && s.bpAwarded > 0) await award(c, s.uid, s.bpAwarded, 'battle', row.challenge_id);
   });
   return true;

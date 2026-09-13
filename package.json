@@ -8,7 +8,8 @@
     "start": "node server.mjs",
     "walker": "node fake-walker.mjs",
     "coach:agent": "node --env-file=.env scripts/coach-agent.mjs",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node --test scripts/*.test.mjs"
   },
   "dependencies": {
     "@clerk/backend": "^3.17.2",

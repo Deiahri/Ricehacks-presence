@@ -6,9 +6,10 @@ import { allowToken, coachConfigured, mintConversationToken } from './coach.mjs'
 import {
   HttpError, buyItem, claimUsername, equipItem, getProfile, globalLeaderboard, hasDb, listFriends, listNotifications,
   markNotificationsRead, personalRecord, recentWorkouts, respondFriendRequest, scoreTargets, sendFriendRequest,
-  setAppearance,
+  setAppearance, workoutDetail, workoutSeries,
 } from './db.mjs';
 import { COSMETICS, DURATIONS, SKIN_TONES, USERNAME_RE } from './game-config.mjs';
+import { userRecap, workoutAdvice } from './insights.mjs';
 
 const MAX_BODY = 4 * 1024;
 const ORIGINS = (process.env.ALLOWED_ORIGINS ?? '*').split(',').map((s) => s.trim()).filter(Boolean);
@@ -63,6 +64,15 @@ function setOf(url) {
   const durationS = Number(url.searchParams.get('durationS'));
   if (!EXERCISES.has(exercise) || !DURATIONS.has(durationS)) throw new HttpError(400, 'bad-set');
   return { exercise, durationS };
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** A workout id query (?id=), or 400 bad-id. */
+function idOf(url) {
+  const id = url.searchParams.get('id') ?? '';
+  if (!UUID.test(id)) throw new HttpError(400, 'bad-id');
+  return id;
 }
 
 /**
@@ -156,6 +166,18 @@ export function createApi(live) {
     'GET /api/leaderboard': async ({ uid }) => globalLeaderboard(uid),
 
     'GET /api/workouts': async ({ uid }) => recentWorkouts(uid),
+
+    // One workout for the replay screen (fast, no AI), its coaching advice (AI, cached), and trend data.
+    'GET /api/workout': async ({ uid, url }) => workoutDetail(uid, idOf(url)),
+
+    'GET /api/workout/advice': async ({ uid, url }) => workoutAdvice(uid, idOf(url)),
+
+    'GET /api/workouts/series': async ({ uid, url }) => {
+      const { exercise, durationS } = url.searchParams.has('exercise') ? setOf(url) : { exercise: null, durationS: null };
+      return workoutSeries(uid, exercise, durationS);
+    },
+
+    'GET /api/recap': async ({ uid }) => userRecap(uid),
 
     'GET /api/pr': async ({ uid, url }) => {
       const { exercise, durationS } = setOf(url);

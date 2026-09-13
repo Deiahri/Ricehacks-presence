@@ -121,15 +121,40 @@ Every battle message after the request carries `challengeId`. The server ignores
 | Request | `challenge_request {to}` (a player's `id`) | challenger: `challenge_outgoing {challengeId, opponent}`; target: `challenge_incoming {challengeId, from}` |
 | Answer (30 s) | `challenge_respond {accept}` · `challenge_cancel` | both: `challenge_accepted {opponent}` or `challenge_update {status}` |
 | Vote (90 s) | `challenge_pick {exercise, durationS}` | both, once both voted: `challenge_resolved {exercise, durationS, picks, coinFlips}` |
-| Cameras (60 s) | `challenge_ready` when the pose model is running | both, once both ready: `challenge_go {countdownMs: 10000, durationS}` |
-| Set | `challenge_rep {reps, score, quality}` per rep | opponent: `challenge_opp {reps, score, quality}` |
-| End | `challenge_final {repScores}` | both: `challenge_result {you, opponent, winnerId, forfeit}` (each side has `bpAwarded`), then one row stored |
-| Solo | `solo_result {exercise, durationS, repScores}` | `saved {ok, reason?, bpAwarded, bp}` (`reason`: `no-db` or `error`) |
+| Cameras (60 s) | `challenge_ready` when the pose model is running | both, once both ready: `challenge_go {countdownMs: 10000, durationS, hpMax, loadouts}` (`loadouts` = each player's battle items, keyed by `id`) |
+| Set | `challenge_rep {reps, score, quality, formScore}` per rep | opponent: `challenge_opp {reps, score, quality}`; both: `challenge_hp {hpMax, you, opponent, event}` |
+| End | `challenge_final {repScores, repDetail?, track?}` | both: `challenge_result {you, opponent, winnerId, forfeit, battle, workoutId}` (each side has `bpAwarded`), then one row stored |
+| Solo | `solo_result {exercise, durationS, repScores, repDetail?, track?}` | `saved {ok, reason?, bpAwarded, bp, workoutId}` (`reason`: `no-db` or `error`) |
 
 - `challenge_update.status` is one of `declined`, `cancelled`, `timeout`, `busy`, `offline` or `left`.
 - The final score is recomputed on the server from `repScores`. Live values are clamped to what's plausible for the duration.
 - If a player's socket closes, or they send `challenge_cancel` mid-set before their final, they forfeit. The result then uses their last live score.
 - If a final never arrives, the server settles 15 s after the set ends.
+- `repDetail` is one `{t, d, sub, c}` per rep (seconds into the set, rep seconds, sub-scores, cues). `track` is the pose recording, `{v: 1, fps: 5|10, joints: 13, aspect, mirrored, frames: base64}` (see the app's `src/game/poseTrack.ts`). Both are optional, and malformed ones are dropped without losing the set. Messages can be up to 256 KB; anything bigger closes the socket.
+
+### The HP duel and battle items
+
+Each fighter starts with 5 HP per second of set length (75 for 15 s). Every rep hits the other player for its points (form ÷ 10), and the player who deals more damage wins; ties go to points, then reps. HP bars stop at 0 (K.O.), but the set keeps going. Only **equipped** items count, as worn when the set starts. The numbers are in `game-config.mjs` (`ITEM_EFFECTS`), and the maths is in `battle-effects.mjs`, which has its own tests (`npm test`):
+
+| Item | Effect |
+|---|---|
+| Low tier shield | Blocks 30% of every hit you take |
+| Iron gauntlet | Your hits deal 1.5× |
+| Warlock hat | Each of your opponent's red reps (form < 50) has a 20% chance to deal −1 instead, which heals you |
+| Magic wand | 5 reps in a row at 90+ form pays +50 BP at the end of the battle, once |
+
+Wand and gauntlet share the main-hand slot, so a player picks one. Items only decide who wins: BP is still score + the outcome bonus (plus the wand surge). Curse rolls come from a per-battle secret seed, so the live HP bars and the final result always agree.
+
+`challenge_hp` and `challenge_result.battle` show the duel from your side: `{hpMax, you, opponent}`. Each side has `{dealt, taken, hp, absorbed, gauntletBonus, cursedReps, cursesCast, cursesSuffered, streak, bestStreak, surge, rawScore, reps, loadout}`. `challenge_hp.event` is null, `{kind: "curse", by: "you" | "opponent"}` or `{kind: "surge", who}`.
+
+## AI coaching (Gemini)
+
+Set `GEMINI_API_KEY` (Google AI Studio) to have Gemini write the replay screen's advice and the Progress recap. `GEMINI_MODEL` is optional; the default is `gemini-2.5-flash`. The server computes the stats itself (per-rep form, fade across the set, cues, PRs, sets per week) and Gemini only writes the words. No names or ids are sent.
+- Advice is cached per workout and viewer.
+- The recap is cached until you record a new workout, or for 3 days at most.
+- Each user can trigger 30 generations an hour.
+
+Without a key, or when Gemini fails, both return rule-based text with `source: "fallback"`. That text isn't cached, so real advice replaces it once a key is set.
 
 ## JSON API
 
@@ -151,4 +176,9 @@ Every route takes `Authorization: Bearer <credential>`: a Clerk session token, o
 | `POST /api/shop/buy {itemId}` | Spend BP; the item is equipped. 402 `insufficient-bp`, 409 `owned` |
 | `POST /api/equip {slot, itemId}` | Wear an owned item, or `itemId: null` to empty the slot. 403 `not-owned`, 400 `wrong-slot` |
 | `GET /api/pr?exercise=&durationS=` | `{bestScore, bestReps}` for that exercise and set length (the coach's "old record") |
+| `GET /api/workouts` | My last 10 sets, newest first: `{id, createdAt, mode, exercise, durationS, score, reps, avgForm, bp, forfeit, opponent, result, hasReplay}` |
+| `GET /api/workout?id=` | One of my sets for the replay screen: `{…, me, opponent, battle, track}`. Each side is `{name, score, reps, avgForm, repScores, repDetail, bp}`; `track` is only your own. 404 `no-workout`, 400 `bad-id` |
+| `GET /api/workout/advice?id=` | `{headline, summary, tips, focusCue, source}` from Gemini (cached), or the fallback text |
+| `GET /api/workouts/series?exercise=&durationS=` | My last 30 sets of that kind (or all of them, with no query), oldest first: `{id, createdAt, mode, exercise, durationS, score, reps, avgForm, result}` |
+| `GET /api/recap` | `{headline, text, trend, source, count}`: how I've been doing lately. `trend` is `improving`, `steady`, `slipping`, `slacking` or `new`; `source` is `none` when I have no workouts |
 | `GET /api/coach/token` | `{token}` for one ElevenLabs WebRTC session. 503 when the coach isn't configured, 429 past 20 an hour |

@@ -123,19 +123,29 @@ check('bad shirt → 400', (await A.api('POST', '/api/appearance', { shirt: 'red
 const look = (await A.api('POST', '/api/appearance', { skin: 's5', shirt: '#12AB34' })).body;
 check('set skin + shirt', look?.skin === 's5' && look.shirt === '#12ab34', JSON.stringify(look));
 
-// Solo BP (anti-spam: an instant result earns nothing)
+// Solo BP (anti-spam: an instant result earns nothing). The early set also carries a malformed pose track, which is
+// dropped without losing the set.
 A.send({ type: 'status', busy: true });
 await sleep(100);
-A.send({ type: 'solo_result', exercise: 'squat', durationS: 15, repScores: Array(15).fill(100) });
+A.send({
+  type: 'solo_result', exercise: 'squat', durationS: 15, repScores: Array(15).fill(100),
+  track: { v: 1, fps: 10, joints: 13, aspect: 0.56, mirrored: true, frames: 'not base64!' },
+});
 const early = await A.next('saved');
 check('instant solo result earns 0 BP', early.ok === true && early.bpAwarded === 0, JSON.stringify(early));
 A.send({ type: 'status', busy: false });
 await sleep(100);
 A.send({ type: 'status', busy: true });
 await sleep(13_200);
-A.send({ type: 'solo_result', exercise: 'squat', durationS: 15, repScores: Array(15).fill(100) });
+// A replayable set: per-rep detail + a 15 s pose track (10 fps × 13 joints × x,y bytes).
+const trackBytes = Buffer.alloc(150 * 13 * 2);
+for (let i = 0; i < trackBytes.length; i++) trackBytes[i] = (i * 7) % 255;
+const soloTrack = { v: 1, fps: 10, joints: 13, aspect: 0.5625, mirrored: true, frames: trackBytes.toString('base64') };
+const soloDetail = Array.from({ length: 15 }, (_, i) => ({ t: i + 0.9, d: 0.9, sub: { depth: 100, torso: 100, symmetry: 100 }, c: ['Good rep'] }));
+A.send({ type: 'solo_result', exercise: 'squat', durationS: 15, repScores: Array(15).fill(100), repDetail: soloDetail, track: soloTrack });
 const solo = await A.next('saved');
 check('15 s solo: BP = score (150)', solo.bpAwarded === 150 && solo.bp === 150, JSON.stringify(solo));
+check('saved carries the workout id', typeof solo.workoutId === 'string' && typeof early.workoutId === 'string');
 A.send({ type: 'status', busy: false });
 
 // Shop
@@ -169,19 +179,32 @@ async function startBattle() {
   await B.next('challenge_resolved');
   A.send({ type: 'challenge_ready', challengeId });
   B.send({ type: 'challenge_ready', challengeId });
-  await Promise.all([A.next('challenge_go'), B.next('challenge_go')]);
-  return challengeId;
+  const [go] = await Promise.all([A.next('challenge_go'), B.next('challenge_go')]);
+  return { challengeId, go };
 }
-let cid = await startBattle();
+// HP duel: A wears the shield, so B's hits land at 70%.
+let { challengeId: cid, go } = await startBattle();
+check('go carries HP and loadouts', go.hpMax === 75 && go.loadouts?.[A.id]?.shield === true && go.loadouts?.[B.id]?.shield === false,
+  JSON.stringify(go));
+A.send({ type: 'challenge_rep', challengeId: cid, reps: 1, score: 10, quality: 'green', formScore: 100 });
+const hpA1 = await A.next('challenge_hp');
+check('live HP: my hit lands on the opponent', hpA1.hpMax === 75 && hpA1.you.dealt === 10 && hpA1.opponent.hp === 65, JSON.stringify(hpA1));
+B.send({ type: 'challenge_rep', challengeId: cid, reps: 1, score: 5, quality: 'yellow', formScore: 50 });
+const hpB = await B.next('challenge_hp', (m) => m.you.dealt > 0);
+check('live HP: the shield absorbs 30%', hpB.you.dealt === 3.5 && hpB.opponent.absorbed === 1.5 && hpB.opponent.hp === 71.5, JSON.stringify(hpB));
 A.send({ type: 'challenge_final', challengeId: cid, repScores: Array(5).fill(100) });
 B.send({ type: 'challenge_final', challengeId: cid, repScores: Array(4).fill(50) });
 const [rA, rB] = await Promise.all([A.next('challenge_result'), B.next('challenge_result')]);
 check('winner gets score + 50', rA.winnerId === A.id && rA.you.bpAwarded === 100, JSON.stringify(rA.you));
 check('loser gets score + 0', rB.you.bpAwarded === 20, JSON.stringify(rB.you));
+check('result has the duel: 50 dealt, 6 absorbed by the shield, 14 taken',
+  rA.battle?.you.dealt === 50 && rA.battle.you.absorbed === 6 && rA.battle.you.taken === 14 && rB.battle?.opponent.dealt === 50,
+  JSON.stringify(rA.battle));
+check('result links the stored workout', typeof rA.workoutId === 'string' && rA.workoutId === rB.workoutId);
 check('result hides device secrets', !JSON.stringify(rA).includes(A.secret) && !JSON.stringify(rA).includes(B.secret));
 
-// Forfeit: A leaves mid-set
-cid = await startBattle();
+// Forfeit: A leaves mid-set (B's rep has no formScore, like an older app)
+({ challengeId: cid } = await startBattle());
 B.send({ type: 'challenge_rep', challengeId: cid, reps: 1, score: 8, quality: 'green' });
 await sleep(100);
 A.send({ type: 'challenge_cancel', challengeId: cid });
@@ -210,6 +233,40 @@ check('history A: forfeit loss, win vs B, solo 150, early solo',
 check('history B: forfeit win, loss vs A (scores from B side)',
   histB?.length === 2 && histB[0].result === 'win' && histB[0].bp === 58
   && histB[1].result === 'loss' && histB[1].score === 20 && histB[1].opponent?.name === nameA && histB[1].opponent.score === 50, brief(histB));
+check('history: replay flag and avg form', histA[2].hasReplay === true && histA[3].hasReplay === false && histA[2].avgForm === 100
+  && histB[1].avgForm === 50, brief(histA));
+
+// One workout: replay data from my side only
+const detail = await A.api('GET', `/api/workout?id=${solo.workoutId}`);
+check('workout detail: rep detail + pose track round-trip',
+  detail.status === 200 && detail.body.me.repDetail.length === 15 && detail.body.me.repDetail[0].t === 0.9
+  && detail.body.me.repDetail[0].sub.depth === 100 && detail.body.track?.frames === soloTrack.frames && detail.body.track.fps === 10,
+  JSON.stringify({ ...detail.body, track: detail.body?.track && { ...detail.body.track, frames: '…' } }).slice(0, 400));
+check('workout detail: malformed track was dropped, set kept',
+  (await A.api('GET', `/api/workout?id=${early.workoutId}`)).body?.track === null);
+check('workout detail: not mine → 404', (await B.api('GET', `/api/workout?id=${solo.workoutId}`)).status === 404);
+check('workout detail: bad id → 400', (await A.api('GET', '/api/workout?id=nope')).status === 400);
+const battleB = (await B.api('GET', `/api/workout?id=${rA.workoutId}`)).body;
+check('battle detail from the opponent side',
+  battleB?.me.name === nameB && battleB.me.repScores.length === 4 && battleB.opponent?.name === nameA && battleB.opponent.repScores.length === 5
+  && battleB.battle?.you.dealt === 14 && battleB.battle.opponent.absorbed === 6 && battleB.result === 'loss', JSON.stringify(battleB));
+
+// Trends
+const series = (await A.api('GET', '/api/workouts/series?exercise=squat&durationS=15')).body;
+check('series: my sets oldest first', series?.length === 4 && series[0].id === early.workoutId && series[3].result === 'loss'
+  && new Date(series[0].createdAt) <= new Date(series[3].createdAt), JSON.stringify(series?.map((s) => [s.mode, s.score])));
+check('series without a set filter', (await A.api('GET', '/api/workouts/series')).body?.length === 4);
+check('series: bad set → 400', (await A.api('GET', '/api/workouts/series?exercise=lunge&durationS=15')).status === 400);
+
+// AI coaching (rule-based text without GEMINI_API_KEY)
+const advice = await A.api('GET', `/api/workout/advice?id=${solo.workoutId}`);
+check('advice: headline + tips', advice.status === 200 && advice.body.headline && advice.body.tips?.length >= 1, JSON.stringify(advice));
+console.log(`INFO  /api/workout/advice source=${advice.body?.source}: ${advice.body?.headline} | ${advice.body?.summary}`);
+check('advice: not mine → 404', (await B.api('GET', `/api/workout/advice?id=${solo.workoutId}`)).status === 404);
+const recap = await A.api('GET', '/api/recap');
+check('recap: text + trend', recap.status === 200 && recap.body.text && recap.body.count === 4, JSON.stringify(recap));
+console.log(`INFO  /api/recap source=${recap.body?.source} trend=${recap.body?.trend}: ${recap.body?.text}`);
+check('recap: nothing to say without workouts', (await C.api('GET', '/api/recap')).body?.source === 'none');
 
 // Global leaderboard: best single set per person; people without sets are listed last
 const board = (await A.api('GET', '/api/leaderboard')).body;

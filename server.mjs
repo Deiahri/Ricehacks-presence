@@ -5,9 +5,10 @@
 // Accounts, friends, BP and the shop are in Postgres (db.mjs) behind a small JSON API (http-api.mjs).
 // Live state is in memory only — restart = empty world. Good enough for a spike.
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { accountFor, clerkEnabled } from './auth.mjs';
+import { diffEvent, hpMaxFor, loadoutOf, orient, resolveBattle } from './battle-effects.mjs';
 import { getProfile, hasDb, initDb, recordChallenge, recordSolo } from './db.mjs';
 import { DURATIONS, battleBp } from './game-config.mjs';
 import { createApi } from './http-api.mjs';
@@ -51,8 +52,9 @@ const server = http.createServer((req, res) => {
   );
 });
 
-// A 5-minute set's final message carries up to ~450 rep scores.
-const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
+// A 5-minute set's final message carries its rep scores, rep detail and pose track (~60 KB at most). A bigger message
+// closes the socket (1009), which mid-battle would be a forfeit, so leave plenty of room.
+const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 const HEX = /^#[0-9a-f]{6}$/i;
@@ -67,9 +69,49 @@ const avgForm = (scores) => (scores.length ? scores.reduce((s, v) => s + v, 0) /
 /** Generous upper bound on reps in a set (the fastest counted rep is 0.8 s). */
 const maxReps = (durationS) => Math.ceil(durationS * 1.5);
 
+const clampForm = (s) => Math.round(Math.min(100, Math.max(0, s)) * 10) / 10;
+
 function repScoresFrom(v, durationS) {
   if (!Array.isArray(v)) return null;
-  return v.filter(isNum).slice(0, maxReps(durationS)).map((s) => Math.round(Math.min(100, Math.max(0, s)) * 10) / 10);
+  return v.filter(isNum).slice(0, maxReps(durationS)).map(clampForm);
+}
+
+const SUB_KEY = /^[a-z_]{1,16}$/;
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+/** Pose tracks carry the 13 joints the skeleton uses (the app's src/game/poseTrack.ts). */
+const TRACK_JOINTS = 13;
+
+/**
+ * Per-rep detail from the app ([{ t, d, sub, c }]), lined up with the already-clamped form scores. Null when it
+ * doesn't fit; the set is still stored without it.
+ */
+function repDetailFrom(v, scores, durationS) {
+  if (!Array.isArray(v) || v.length !== scores.length) return null;
+  const out = [];
+  for (let i = 0; i < v.length; i++) {
+    const r = v[i];
+    if (!r || typeof r !== 'object' || !isNum(r.t)) return null;
+    const sub = {};
+    if (r.sub && typeof r.sub === 'object') {
+      for (const [k, x] of Object.entries(r.sub).slice(0, 4)) if (SUB_KEY.test(k) && isNum(x)) sub[k] = clampForm(x);
+    }
+    const c = Array.isArray(r.c) ? r.c.filter((x) => typeof x === 'string').slice(0, 3).map((x) => x.slice(0, 60)) : [];
+    const t = Math.round(Math.min(durationS + 2, Math.max(0, r.t)) * 100) / 100;
+    const d = isNum(r.d) ? Math.round(Math.min(30, Math.max(0, r.d)) * 100) / 100 : null;
+    out.push({ t, s: scores[i], d, sub, c });
+  }
+  return out;
+}
+
+/** A pose track from the app ({ v: 1, fps, joints, aspect, mirrored, frames: base64 }), or null if malformed. */
+function trackFrom(v, durationS) {
+  if (!v || typeof v !== 'object' || v.v !== 1 || (v.fps !== 5 && v.fps !== 10)) return null;
+  if (v.joints !== TRACK_JOINTS || !isNum(v.aspect) || v.aspect < 0.2 || v.aspect > 5) return null;
+  if (typeof v.frames !== 'string' || !BASE64.test(v.frames)) return null;
+  const frames = Buffer.from(v.frames, 'base64');
+  const stride = TRACK_JOINTS * 2;
+  if (!frames.length || frames.length % stride || frames.length / stride > (durationS + 1) * v.fps) return null;
+  return { fps: v.fps, joints: TRACK_JOINTS, aspect: v.aspect, mirrored: v.mirrored === true, frames };
 }
 
 function socketOf(id) {
@@ -149,8 +191,10 @@ function createChallenge(a, b) {
     picks: new Map(),
     config: null,
     ready: new Set(),
-    live: new Map(), // latest {reps, score} per socket
-    finals: new Map(), // final repScores per socket
+    live: new Map(), // latest {reps, score, scores: form per rep} per socket
+    finals: new Map(), // final {scores, detail, track} per socket
+    seed: randomBytes(16).toString('hex'), // fixes the warlock hat's curse rolls; never sent
+    lastDuel: null, // the last HP duel sent live, to spot new curses / surges
     timer: undefined,
   };
   challengeOf.set(a, ch);
@@ -180,6 +224,25 @@ function abort(ch, status) {
   for (const ws of [ch.a, ch.b]) send(ws, { type: 'challenge_update', challengeId: ch.id, status });
 }
 
+/** The HP duel from each side's form scores (`scoresOf(socket)`), with the gear they wore when the set started. */
+function duel(ch, scoresOf) {
+  return resolveBattle({
+    seed: ch.seed,
+    durationS: ch.config.durationS,
+    a: { equipped: ch.info.get(ch.a).equipped, scores: scoresOf(ch.a) },
+    b: { equipped: ch.info.get(ch.b).equipped, scores: scoresOf(ch.b) },
+  });
+}
+
+/** Live HP bars: after every rep, both phones get the duel from their own side, plus any curse / surge that just happened. */
+function sendHp(ch) {
+  const res = duel(ch, (ws) => ch.live.get(ws)?.scores ?? []);
+  for (const [ws, side] of [[ch.a, 'a'], [ch.b, 'b']]) {
+    send(ws, { type: 'challenge_hp', challengeId: ch.id, ...orient(res, side), event: diffEvent(ch.lastDuel, res, side) });
+  }
+  ch.lastDuel = res;
+}
+
 /** Score a live challenge, pay BP, tell both players, store one row. `forfeitBy` = the socket that left early. */
 function finish(ch, forfeitBy = null) {
   if (ch.phase === 'done') return;
@@ -187,36 +250,44 @@ function finish(ch, forfeitBy = null) {
   const side = (ws) => {
     const { id, userId, uid, name, shirt, skin, equipped } = ch.info.get(ws);
     const f = ch.finals.get(ws);
-    if (f) return { id, userId, uid, name, shirt, skin, equipped, reps: f.length, score: totalScore(f), repScores: f };
-    const l = ch.live.get(ws) ?? { reps: 0, score: 0 }; // never sent a final: last live update
-    return { id, userId, uid, name, shirt, skin, equipped, reps: l.reps, score: l.score, repScores: [] };
+    const who = { id, userId, uid, name, shirt, skin, equipped };
+    if (f) return { ...who, reps: f.scores.length, score: totalScore(f.scores), repScores: f.scores, detail: f.detail, track: f.track };
+    const l = ch.live.get(ws) ?? { reps: 0, score: 0, scores: [] }; // never sent a final: last live update
+    return { ...who, reps: l.reps, score: l.score, repScores: l.scores, detail: null, track: null };
   };
   const A = side(ch.a);
   const B = side(ch.b);
+  const res = duel(ch, (ws) => (ws === ch.a ? A : B).repScores);
+  // Most damage wins (items count), then points, then reps. Leaving mid-set hands the win to the other side.
   let winner = null;
   if (forfeitBy) winner = forfeitBy === ch.a ? B : A;
+  else if (res.a.dealt !== res.b.dealt) winner = res.a.dealt > res.b.dealt ? A : B;
   else if (A.score !== B.score) winner = A.score > B.score ? A : B;
   else if (A.reps !== B.reps) winner = A.reps > B.reps ? A : B;
 
   // Only accounts can hold BP, so a side the database never resolved earns nothing.
   const forfeiter = forfeitBy ? (forfeitBy === ch.a ? A : B) : null;
-  for (const S of [A, B]) {
+  for (const [S, key] of [[A, 'a'], [B, 'b']]) {
     const outcome = winner === null ? 'draw' : winner === S ? 'win' : 'loss';
-    S.bpAwarded = S.uid ? battleBp(S.score, outcome, S === forfeiter) : 0;
+    S.bpAwarded = S.uid ? battleBp(S.score, outcome, S === forfeiter, res[key].surge) : 0;
   }
 
-  const pub = ({ userId: _userId, uid: _uid, ...rest }) => rest;
-  const base = { type: 'challenge_result', challengeId: ch.id, winnerId: winner?.id ?? null, forfeit: Boolean(forfeitBy) };
-  send(ch.a, { ...base, you: pub(A), opponent: pub(B) });
-  send(ch.b, { ...base, you: pub(B), opponent: pub(A) });
+  const workoutId = randomUUID();
+  const pub = ({ userId: _userId, uid: _uid, detail: _detail, track: _track, ...rest }) => rest;
+  const base = { type: 'challenge_result', challengeId: ch.id, workoutId, winnerId: winner?.id ?? null, forfeit: Boolean(forfeitBy) };
+  send(ch.a, { ...base, you: pub(A), opponent: pub(B), battle: orient(res, 'a') });
+  send(ch.b, { ...base, you: pub(B), opponent: pub(A), battle: orient(res, 'b') });
 
   recordChallenge({
-    mode: 'challenge', exercise: ch.config.exercise, duration_s: ch.config.durationS,
+    id: workoutId, mode: 'challenge', exercise: ch.config.exercise, duration_s: ch.config.durationS,
     user_id: A.userId, user_name: A.name, score: A.score, reps: A.reps, avg_form: avgForm(A.repScores), rep_scores: A.repScores,
+    rep_detail: A.detail,
     challenge_id: ch.id, opponent_id: B.userId, opponent_name: B.name, opponent_score: B.score, opponent_reps: B.reps,
+    opponent_rep_scores: B.repScores, opponent_rep_detail: B.detail, opponent_avg_form: avgForm(B.repScores),
     winner_id: winner?.userId ?? null, forfeit: Boolean(forfeitBy),
     user_uid: A.uid, opponent_uid: B.uid, winner_uid: winner?.uid ?? null, user_bp: A.bpAwarded, opponent_bp: B.bpAwarded,
-  }, [A, B]).then(
+    battle_detail: { hpMax: res.hpMax, user: res.a, opponent: res.b },
+  }, [A, B], [A.track, B.track]).then(
     (stored) => { if (stored) for (const S of [A, B]) if (S.uid) notifyProfile(S.uid); },
     (e) => console.error('[db] challenge save failed:', e.message),
   );
@@ -290,24 +361,42 @@ function onChallenge(ws, me, msg) {
       if (ch.ready.size < 2) return;
       ch.phase = 'live';
       setTimer(ch, COUNTDOWN_MS + ch.config.durationS * 1000 + FINAL_GRACE_MS, () => finish(ch));
-      const go = { type: 'challenge_go', challengeId: ch.id, countdownMs: COUNTDOWN_MS, durationS: ch.config.durationS };
+      // Items count as worn when the set starts (gear may have changed since the request).
+      const loadouts = {};
+      for (const s of [ch.a, ch.b]) {
+        const info = ch.info.get(s);
+        const p = players.get(s);
+        if (p) info.equipped = p.equipped ?? {};
+        loadouts[info.id] = loadoutOf(info.equipped);
+      }
+      const go = {
+        type: 'challenge_go', challengeId: ch.id, countdownMs: COUNTDOWN_MS, durationS: ch.config.durationS,
+        hpMax: hpMaxFor(ch.config.durationS), loadouts,
+      };
       send(ch.a, go);
       send(ch.b, go);
       return;
     }
     case 'challenge_rep': {
+      // { reps, score, quality, formScore }: formScore (the new rep's form) drives the live HP duel. Clients that
+      // don't send it still relay reps and points as before.
       if (!mine || ch.phase !== 'live' || !QUALITIES.has(msg.quality)) return;
+      const live = ch.live.get(ws) ?? { reps: 0, score: 0, scores: [] };
       const reps = clampInt(msg.reps, 0, maxReps(ch.config.durationS));
-      const score = clampInt(msg.score, 0, reps * 10);
-      ch.live.set(ws, { reps, score });
-      send(other(ch, ws), { type: 'challenge_opp', challengeId: ch.id, reps, score, quality: msg.quality });
+      if (isNum(msg.formScore) && reps === live.scores.length + 1) live.scores.push(clampForm(msg.formScore));
+      live.reps = reps;
+      live.score = live.scores.length === reps && reps > 0 ? totalScore(live.scores) : clampInt(msg.score, 0, reps * 10);
+      ch.live.set(ws, live);
+      send(other(ch, ws), { type: 'challenge_opp', challengeId: ch.id, reps, score: live.score, quality: msg.quality });
+      sendHp(ch);
       return;
     }
     case 'challenge_final': {
       if (!mine || ch.phase !== 'live' || ch.finals.has(ws)) return;
       const scores = repScoresFrom(msg.repScores, ch.config.durationS);
       if (!scores) return;
-      ch.finals.set(ws, scores);
+      const { durationS } = ch.config;
+      ch.finals.set(ws, { scores, detail: repDetailFrom(msg.repDetail, scores, durationS), track: trackFrom(msg.track, durationS) });
       if (ch.finals.size === 2) finish(ch);
       return;
     }
@@ -324,9 +413,10 @@ function onSoloResult(ws, me, msg) {
   recordSolo({
     uid: me.uid, secret: me.userId, name: me.name, exercise: msg.exercise, durationS: msg.durationS,
     scores, score: totalScore(scores), avgForm: avgForm(scores), earn,
+    detail: repDetailFrom(msg.repDetail, scores, msg.durationS), track: trackFrom(msg.track, msg.durationS),
   }).then(
-    ({ stored, bpAwarded, bp }) => {
-      send(ws, { type: 'saved', ok: stored, reason: stored ? undefined : 'no-db', bpAwarded, bp });
+    ({ stored, bpAwarded, bp, workoutId }) => {
+      send(ws, { type: 'saved', ok: stored, reason: stored ? undefined : 'no-db', bpAwarded, bp, workoutId });
       if (stored && me.uid) notifyProfile(me.uid);
     },
     (e) => {
