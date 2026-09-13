@@ -9,8 +9,8 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { accountFor, clerkEnabled } from './auth.mjs';
 import { diffEvent, hpMaxFor, loadoutOf, orient, resolveBattle } from './battle-effects.mjs';
-import { getProfile, hasDb, initDb, recordChallenge, recordSolo } from './db.mjs';
-import { DURATIONS, battleBp } from './game-config.mjs';
+import { getProfile, hasDb, initDb, recordChallenge, recordSolo, refreshProfile } from './db.mjs';
+import { DURATIONS, battleBp, xpForScores } from './game-config.mjs';
 import { createApi } from './http-api.mjs';
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -164,7 +164,7 @@ function notifyProfile(uid) {
 async function resolveAccount(ws, entry, credential) {
   try {
     const { uid, key } = await accountFor(credential, entry.shirt);
-    const profile = await getProfile(uid);
+    const profile = await refreshProfile(uid);
     if (players.get(ws) !== entry) return; // closed or said hello again meanwhile
     entry.uid = uid;
     entry.userId = key;
@@ -267,11 +267,13 @@ function finish(ch, forfeitBy = null) {
   else if (A.score !== B.score) winner = A.score > B.score ? A : B;
   else if (A.reps !== B.reps) winner = A.reps > B.reps ? A : B;
 
-  // Only accounts can hold BP, so a side the database never resolved earns nothing.
+  // Only accounts can hold BP or XP, so a side the database never resolved earns nothing. Weekly XP is paid win or
+  // lose (1 per rep, 2 per perfect rep), but not to a forfeiter.
   const forfeiter = forfeitBy ? (forfeitBy === ch.a ? A : B) : null;
   for (const [S, key] of [[A, 'a'], [B, 'b']]) {
     const outcome = winner === null ? 'draw' : winner === S ? 'win' : 'loss';
     S.bpAwarded = S.uid ? battleBp(S.score, outcome, S === forfeiter, res[key].surge) : 0;
+    S.xpAwarded = S.uid && S !== forfeiter ? xpForScores(S.repScores) : 0;
   }
 
   const workoutId = randomUUID();
@@ -288,6 +290,7 @@ function finish(ch, forfeitBy = null) {
     opponent_rep_scores: B.repScores, opponent_rep_detail: B.detail, opponent_avg_form: avgForm(B.repScores),
     winner_id: winner?.userId ?? null, forfeit: Boolean(forfeitBy),
     user_uid: A.uid, opponent_uid: B.uid, winner_uid: winner?.uid ?? null, user_bp: A.bpAwarded, opponent_bp: B.bpAwarded,
+    user_xp: A.xpAwarded, opponent_xp: B.xpAwarded,
     battle_detail: { hpMax: res.hpMax, user: res.a, opponent: res.b },
   }, [A, B], [A.track, B.track]).then(
     (stored) => { if (stored) for (const S of [A, B]) if (S.uid) notifyProfile(S.uid); },
@@ -417,8 +420,8 @@ function onSoloResult(ws, me, msg) {
     scores, score: totalScore(scores), avgForm: avgForm(scores), earn,
     detail: repDetailFrom(msg.repDetail, scores, msg.durationS), track: trackFrom(msg.track, msg.durationS),
   }).then(
-    ({ stored, bpAwarded, bp, workoutId }) => {
-      send(ws, { type: 'saved', ok: stored, reason: stored ? undefined : 'no-db', bpAwarded, bp, workoutId });
+    ({ stored, bpAwarded, bp, workoutId, xpAwarded, goalMet }) => {
+      send(ws, { type: 'saved', ok: stored, reason: stored ? undefined : 'no-db', bpAwarded, bp, workoutId, xpAwarded, goalMet });
       if (stored && me.uid) notifyProfile(me.uid);
     },
     (e) => {

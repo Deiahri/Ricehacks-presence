@@ -1,7 +1,8 @@
 // Accounts, friends, BP and workout history in Postgres (Tiger Cloud). DATABASE_URL comes from the environment
 // and is never logged. Without it (local dev) nothing is stored and the /api routes answer 503, so the relay still runs.
 import pg from 'pg';
-import { AUTO_EQUIP_ON_BUY, COSMETICS, SLOTS, STARTING_BP, battleBp, levelFor, soloBp } from './game-config.mjs';
+import { AUTO_EQUIP_ON_BUY, COSMETICS, SLOTS, STARTING_BP, WHEEL, battleBp, soloBp, xpForScores } from './game-config.mjs';
+import { addDays, buildProgress, pickWedge, settleWeek } from './progress.mjs';
 import { personaConfigured } from './persona.mjs';
 
 const DDL = `
@@ -152,13 +153,46 @@ ALTER TABLE users
   ADD COLUMN IF NOT EXISTS verified_at     timestamptz,
   ADD COLUMN IF NOT EXISTS persona_inquiry text;
 CREATE UNIQUE INDEX IF NOT EXISTS users_persona_inquiry_key ON users (persona_inquiry);
+
+-- Weekly XP goal (Monday→Sunday in the user's zone tz), banked streak-saver days, and one row per week since the
+-- goal was set: its XP, when the goal was met, saver days spent keeping it open past Sunday, closed once it's missed
+-- for good, and the wheel reward once spun (a met week with no reward yet owes a spin).
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS weekly_goal integer,
+  ADD COLUMN IF NOT EXISTS goal_since  timestamptz,
+  ADD COLUMN IF NOT EXISTS tz          text,
+  ADD COLUMN IF NOT EXISTS saver_days  integer NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS goal_weeks (
+  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  week_start date NOT NULL,
+  goal       integer NOT NULL,
+  xp         integer NOT NULL DEFAULT 0,
+  met_at     timestamptz,
+  extra_days integer NOT NULL DEFAULT 0,
+  closed     boolean NOT NULL DEFAULT false,
+  reward     jsonb,
+  PRIMARY KEY (user_id, week_start)
+);
+-- XP each side earned for a set (1 per rep, 2 per perfect rep; 0 when the set earned no BP). Older rows are filled in once.
+ALTER TABLE workouts
+  ADD COLUMN IF NOT EXISTS user_xp     integer,
+  ADD COLUMN IF NOT EXISTS opponent_xp integer;
+UPDATE workouts SET user_xp = CASE WHEN user_bp > 0
+  THEN cardinality(rep_scores) + (SELECT count(*) FROM unnest(rep_scores) s WHERE s >= 80) ELSE 0 END WHERE user_xp IS NULL;
+UPDATE workouts SET opponent_xp = CASE WHEN opponent_bp > 0 AND opponent_rep_scores IS NOT NULL
+  THEN cardinality(opponent_rep_scores) + (SELECT count(*) FROM unnest(opponent_rep_scores) s WHERE s >= 80) ELSE 0 END WHERE opponent_xp IS NULL;
+CREATE INDEX IF NOT EXISTS workouts_user_uid_idx     ON workouts (user_uid, created_at DESC);
+CREATE INDEX IF NOT EXISTS workouts_opponent_uid_idx ON workouts (opponent_uid, created_at DESC);
+-- The wheel pays BP too.
+ALTER TABLE bp_ledger DROP CONSTRAINT IF EXISTS bp_ledger_reason_check;
+ALTER TABLE bp_ledger ADD CONSTRAINT bp_ledger_reason_check CHECK (reason IN ('solo', 'battle', 'purchase', 'grant', 'wheel'));
 `;
 
 const COLUMNS = [
   'id', 'mode', 'exercise', 'duration_s', 'user_id', 'user_name', 'score', 'reps', 'avg_form', 'rep_scores',
   'challenge_id', 'opponent_id', 'opponent_name', 'opponent_score', 'opponent_reps', 'winner_id', 'forfeit',
   'user_uid', 'opponent_uid', 'winner_uid', 'user_bp', 'opponent_bp',
-  'rep_detail', 'opponent_rep_scores', 'opponent_rep_detail', 'opponent_avg_form', 'battle_detail',
+  'rep_detail', 'opponent_rep_scores', 'opponent_rep_detail', 'opponent_avg_form', 'battle_detail', 'user_xp', 'opponent_xp',
 ];
 /** pg sends JS arrays as Postgres arrays, so jsonb values go over as JSON text. */
 const JSONB = new Set(['rep_detail', 'opponent_rep_detail', 'battle_detail']);
@@ -289,18 +323,37 @@ export async function ensureAuthUser(sub, shirt = null) {
   return rows[0].id;
 }
 
+/** Today's date and this week's Monday, in the user's zone. */
+const LOCAL_TODAY = `(now() AT TIME ZONE COALESCE(u.tz, 'UTC'))::date`;
+const LOCAL_WEEK = `date_trunc('week', now() AT TIME ZONE COALESCE(u.tz, 'UTC'))::date`;
+
 const PROFILE_SELECT = `
-  SELECT u.id, u.username, u.shirt, u.skin, u.bp, u.equipped, u.verified_at,
+  SELECT u.id, u.username, u.shirt, u.skin, u.bp, u.equipped, u.verified_at, u.weekly_goal, u.saver_days,
     ARRAY(SELECT item_id FROM user_items WHERE user_id = u.id ORDER BY acquired_at) AS owned,
-    (SELECT COALESCE(sum(delta), 0) FROM bp_ledger WHERE user_id = u.id AND delta > 0)::int AS earned,
     (SELECT count(*) FROM workouts WHERE winner_uid = u.id)::int AS wins,
     (SELECT count(*) FROM workouts WHERE mode = 'challenge' AND winner_uid IS NOT NULL AND winner_uid <> u.id
-       AND (user_uid = u.id OR opponent_uid = u.id))::int AS losses
+       AND (user_uid = u.id OR opponent_uid = u.id))::int AS losses,
+    (SELECT count(*) FROM goal_weeks WHERE user_id = u.id AND met_at IS NOT NULL)::int AS weeks_met,
+    EXISTS (SELECT 1 FROM goal_weeks WHERE user_id = u.id AND met_at IS NOT NULL AND reward IS NULL) AS pending_reward,
+    (SELECT row_to_json(w) FROM (
+       SELECT g.xp, g.goal, g.met_at IS NOT NULL AS met FROM goal_weeks g WHERE g.user_id = u.id AND g.week_start = ${LOCAL_WEEK}) w
+    ) AS this_week,
+    (SELECT row_to_json(w) FROM (
+       SELECT g.week_start::text AS "weekStart", g.xp, g.goal, ((g.week_start + 7 + g.extra_days) - ${LOCAL_TODAY})::int AS "daysLeft"
+       FROM goal_weeks g WHERE g.user_id = u.id AND NOT g.closed AND g.met_at IS NULL AND g.week_start < ${LOCAL_WEEK}
+       ORDER BY g.week_start DESC LIMIT 1) w
+    ) AS extension
   FROM users u WHERE u.id = ANY($1::uuid[])`;
 
 const toProfile = (r) => ({
   id: r.id, username: r.username, shirt: r.shirt, skin: r.skin, bp: r.bp, equipped: r.equipped ?? {}, owned: r.owned,
-  wins: r.wins, losses: r.losses, level: levelFor(r.earned),
+  wins: r.wins, losses: r.losses,
+  // Every week the goal was met is a level.
+  level: 1 + r.weeks_met,
+  weeklyGoal: r.weekly_goal, weekXp: r.this_week?.xp ?? 0, weekMet: r.this_week?.met ?? false,
+  saverDays: r.saver_days, pendingReward: r.pending_reward,
+  // Last week, while a saver day keeps it open (null otherwise; stale until the next settle, hence the daysLeft check).
+  extension: r.extension && r.extension.daysLeft > 0 ? r.extension : null,
   // Verification off (no Persona key) = everyone counts as verified.
   verified: !personaConfigured() || r.verified_at !== null,
 });
@@ -311,11 +364,17 @@ async function profiles(ids) {
   return rows.map(toProfile);
 }
 
-/** { id, username, shirt, bp, equipped, owned[], wins, losses, level } */
+/** { id, username, shirt, bp, equipped, owned[], wins, losses, level, weeklyGoal, weekXp, … } */
 export async function getProfile(uid) {
   const [p] = await profiles([uid]);
   if (!p) throw new HttpError(404, 'no-user');
   return p;
+}
+
+/** The profile after settling the user's weeks (a past week may just have closed or spent a saver). */
+export async function refreshProfile(uid) {
+  await withTx((c) => settleWeeks(c, uid));
+  return getProfile(uid);
 }
 
 export async function claimUsername(uid, username) {
@@ -445,6 +504,137 @@ export async function friendIds(uid) {
   const { rows } = await q(
     `SELECT CASE WHEN user_a = $1 THEN user_b ELSE user_a END AS id FROM friendships WHERE user_a = $1 OR user_b = $1`, [uid]);
   return rows.map((r) => r.id);
+}
+
+// --- weekly goal ----------------------------------------------------------------
+
+/**
+ * Bring `uid`'s week rows up to date, inside a transaction (locks the user row): add the rows since the goal was set
+ * and close unfinished past weeks, spending one banked saver day per day past Sunday first.
+ * Resolves { goal, tz, today, week, savers }, or null while no goal is set.
+ */
+async function settleWeeks(c, uid) {
+  const { rows: [u] } = await c.query(
+    `SELECT weekly_goal, goal_since, COALESCE(tz, 'UTC') AS tz, saver_days FROM users WHERE id = $1 FOR UPDATE`, [uid]);
+  if (!u?.weekly_goal) return null;
+  const { rows: [d] } = await c.query(
+    `SELECT (now() AT TIME ZONE $1)::date::text AS today, date_trunc('week', now() AT TIME ZONE $1)::date::text AS week,
+            greatest(date_trunc('week', $2::timestamptz AT TIME ZONE $1)::date, date_trunc('week', now() AT TIME ZONE $1)::date - 364)::text AS first`,
+    [u.tz, u.goal_since]);
+  await c.query(
+    `INSERT INTO goal_weeks (user_id, week_start, goal)
+     SELECT $1, s::date, $4 FROM generate_series($2::date, $3::date, interval '7 days') s ON CONFLICT DO NOTHING`,
+    [uid, d.first, d.week, u.weekly_goal]);
+  const { rows: open } = await c.query(
+    `SELECT week_start::text, extra_days FROM goal_weeks
+     WHERE user_id = $1 AND week_start < $2 AND NOT closed AND met_at IS NULL ORDER BY week_start`, [uid, d.week]);
+  let savers = u.saver_days;
+  for (const w of open) {
+    const s = settleWeek({ weekStart: w.week_start, extraDays: w.extra_days, savers, today: d.today });
+    savers = s.saversLeft;
+    if (s.extraDays !== w.extra_days || s.closed) {
+      await c.query('UPDATE goal_weeks SET extra_days = $3, closed = $4 WHERE user_id = $1 AND week_start = $2',
+        [uid, w.week_start, s.extraDays, s.closed]);
+    }
+  }
+  if (savers !== u.saver_days) await c.query('UPDATE users SET saver_days = $2 WHERE id = $1', [uid, savers]);
+  return { goal: u.weekly_goal, tz: u.tz, today: d.today, week: d.week, savers };
+}
+
+/**
+ * Credit `xp` to this week and to a past week a saver is keeping open (a set on a bonus day counts for both).
+ * Resolves the Mondays of the weeks that just reached their goal, i.e. the level-ups.
+ */
+async function addWeekXp(c, uid, xp) {
+  const s = await settleWeeks(c, uid);
+  if (!s || xp <= 0) return [];
+  const { rows } = await c.query(
+    `UPDATE goal_weeks SET xp = xp + $3, met_at = COALESCE(met_at, CASE WHEN xp + $3 >= goal THEN now() END)
+     WHERE user_id = $1 AND NOT closed AND week_start <= $2 AND (week_start = $2 OR met_at IS NULL)
+     RETURNING week_start::text, (met_at IS NOT NULL AND xp - $3 < goal) AS just_met`, [uid, s.week, xp]);
+  return rows.filter((r) => r.just_met).map((r) => r.week_start);
+}
+
+/** Set the weekly XP goal (range-checked by the caller) and the user's IANA zone. 400 bad-tz for a zone Postgres doesn't know. */
+export async function setWeeklyGoal(uid, goal, tz) {
+  if (tz !== null && !(await q('SELECT 1 FROM pg_timezone_names WHERE name = $1', [tz])).rowCount) throw new HttpError(400, 'bad-tz');
+  await withTx(async (c) => {
+    await c.query(
+      'UPDATE users SET weekly_goal = $2, goal_since = COALESCE(goal_since, now()), tz = COALESCE($3, tz) WHERE id = $1', [uid, goal, tz]);
+    const s = await settleWeeks(c, uid);
+    // The week in progress takes the new goal (a lower one can complete it on the spot).
+    await c.query(
+      `UPDATE goal_weeks SET goal = $3, met_at = COALESCE(met_at, CASE WHEN xp >= $3 THEN now() END) WHERE user_id = $1 AND week_start = $2`,
+      [uid, s.week, goal]);
+  });
+  return getProfile(uid);
+}
+
+/** Recent weeks and their days for the progress calendar; see buildProgress for the shape. */
+export async function weeklyProgress(uid, weeksBack = 12) {
+  return withTx(async (c) => {
+    const s = await settleWeeks(c, uid);
+    if (!s) {
+      const { rows: [u] } = await c.query(
+        `SELECT saver_days, (now() AT TIME ZONE COALESCE(tz, 'UTC'))::date::text AS today,
+                date_trunc('week', now() AT TIME ZONE COALESCE(tz, 'UTC'))::date::text AS week FROM users WHERE id = $1`, [uid]);
+      if (!u) throw new HttpError(404, 'no-user');
+      return buildProgress({ goal: null, today: u.today, thisWeek: u.week, savers: u.saver_days, weeks: [], days: new Map(), all: [] });
+    }
+    const from = addDays(s.week, -7 * (weeksBack - 1));
+    const { rows: weeks } = await c.query(
+      `SELECT week_start::text AS start, goal, xp, met_at IS NOT NULL AS met, extra_days AS "extraDays", closed, reward IS NOT NULL AS spun
+       FROM goal_weeks WHERE user_id = $1 AND week_start >= $2 ORDER BY week_start`, [uid, from]);
+    const { rows: days } = await c.query(
+      `SELECT day::text, sum(xp)::int AS xp, count(*)::int AS sets FROM (
+         SELECT (created_at AT TIME ZONE $2)::date AS day, user_xp AS xp FROM workouts
+           WHERE user_uid = $1 AND user_xp > 0 AND created_at >= ($3::date::timestamp AT TIME ZONE $2)
+         UNION ALL
+         SELECT (created_at AT TIME ZONE $2)::date, opponent_xp FROM workouts
+           WHERE opponent_uid = $1 AND opponent_xp > 0 AND created_at >= ($3::date::timestamp AT TIME ZONE $2)
+       ) t GROUP BY day`, [uid, s.tz, from]);
+    const { rows: all } = await c.query(
+      `SELECT week_start::text AS start, met_at IS NOT NULL AS met, closed, reward IS NOT NULL AS spun
+       FROM goal_weeks WHERE user_id = $1 ORDER BY week_start DESC`, [uid]);
+    return buildProgress({
+      goal: s.goal, today: s.today, thisWeek: s.week, savers: s.savers, weeks, all,
+      days: new Map(days.map((r) => [r.day, { xp: r.xp, sets: r.sets }])),
+    });
+  });
+}
+
+/**
+ * Spin the reward wheel for the oldest met week that hasn't been spun, and pay out: saver days, BP, or an unowned
+ * cosmetic (worn at once; +20 BP when everything is owned). 409 no-reward when nothing is owed.
+ * Resolves { reward: { id, kind, days? | bp? | itemId? }, profile }.
+ */
+export async function spinWheel(uid, rng = Math.random) {
+  const reward = await withTx(async (c) => {
+    if (!(await settleWeeks(c, uid))) throw new HttpError(409, 'no-goal');
+    const { rows: [w] } = await c.query(
+      `SELECT week_start::text FROM goal_weeks WHERE user_id = $1 AND met_at IS NOT NULL AND reward IS NULL ORDER BY week_start LIMIT 1`, [uid]);
+    if (!w) throw new HttpError(409, 'no-reward');
+    const owned = (await c.query('SELECT item_id FROM user_items WHERE user_id = $1', [uid])).rows.map((r) => r.item_id);
+    const unowned = Object.keys(COSMETICS).filter((id) => !owned.includes(id));
+    let wedge = pickWedge(rng());
+    if (wedge.kind === 'item' && !unowned.length) wedge = WHEEL.find((x) => x.id === 'bp20');
+    const reward = { id: wedge.id, kind: wedge.kind, week: w.week_start };
+    if (wedge.kind === 'saver') {
+      reward.days = wedge.days;
+      await c.query('UPDATE users SET saver_days = saver_days + $2 WHERE id = $1', [uid, wedge.days]);
+    } else if (wedge.kind === 'bp') {
+      reward.bp = wedge.bp;
+      await award(c, uid, wedge.bp, 'wheel', w.week_start);
+    } else {
+      reward.itemId = unowned[Math.floor(rng() * unowned.length)];
+      await c.query('INSERT INTO user_items (user_id, item_id) VALUES ($1, $2)', [uid, reward.itemId]);
+      await c.query('UPDATE users SET equipped = equipped || jsonb_build_object($2::text, $3::text) WHERE id = $1',
+        [uid, COSMETICS[reward.itemId].slot, reward.itemId]);
+    }
+    await c.query('UPDATE goal_weeks SET reward = $3 WHERE user_id = $1 AND week_start = $2', [uid, w.week_start, JSON.stringify(reward)]);
+    return reward;
+  });
+  return { reward, profile: await getProfile(uid) };
 }
 
 // --- shop ---------------------------------------------------------------------
@@ -716,28 +906,30 @@ async function award(c, uid, delta, reason, ref) {
  */
 export async function recordSolo({ uid, secret, name, exercise, durationS, scores, score, avgForm, earn, detail = null, track = null }) {
   const bpAwarded = uid && earn ? soloBp(score) : 0;
+  const xpAwarded = uid && earn ? xpForScores(scores) : 0;
   if (!pool) {
     console.log(`[db] skipped solo ${exercise} ${durationS}s score=${score} reps=${scores.length}`);
-    return { stored: false, bpAwarded: 0, bp: null, workoutId: null };
+    return { stored: false, bpAwarded: 0, bp: null, workoutId: null, xpAwarded: 0, goalMet: false };
   }
   return withTx(async (c) => {
     const row = {
       mode: 'solo', exercise, duration_s: durationS, user_id: secret, user_name: name, score, reps: scores.length,
-      avg_form: avgForm, rep_scores: scores, forfeit: false, user_uid: uid, user_bp: bpAwarded, rep_detail: detail,
+      avg_form: avgForm, rep_scores: scores, forfeit: false, user_uid: uid, user_bp: bpAwarded, rep_detail: detail, user_xp: xpAwarded,
     };
     const { rows } = await c.query(INSERT, insertParams(row));
     const workoutId = rows[0].id;
     await insertTracks(c, workoutId, [track && { ...track, side: 'user' }]);
     let bp = null;
     if (uid && bpAwarded > 0) bp = await award(c, uid, bpAwarded, 'solo', workoutId);
-    return { stored: true, bpAwarded, bp, workoutId };
+    const goalMet = uid ? (await addWeekXp(c, uid, xpAwarded)).length > 0 : false;
+    return { stored: true, bpAwarded, bp, workoutId, xpAwarded, goalMet };
   });
 }
 
 /**
- * Store a finished battle (one row, `row.id` chosen by the caller) and pay both sides.
- * `sides` = [{ uid, bpAwarded }] for the user and opponent; `tracks` = [userTrack, opponentTrack] (either may be null).
- * Resolves true when stored.
+ * Store a finished battle (one row, `row.id` chosen by the caller) and pay both sides their BP and weekly XP.
+ * `sides` = [{ uid, bpAwarded, xpAwarded }] for the user and opponent; `tracks` = [userTrack, opponentTrack] (either
+ * may be null). Resolves true when stored.
  */
 export async function recordChallenge(row, sides, tracks = []) {
   if (!pool) {
@@ -748,7 +940,11 @@ export async function recordChallenge(row, sides, tracks = []) {
     const { rows } = await c.query(INSERT, insertParams(row));
     const [user, opponent] = tracks;
     await insertTracks(c, rows[0].id, [user && { ...user, side: 'user' }, opponent && { ...opponent, side: 'opponent' }]);
-    for (const s of sides) if (s.uid && s.bpAwarded > 0) await award(c, s.uid, s.bpAwarded, 'battle', row.challenge_id);
+    for (const s of sides) {
+      if (!s.uid) continue;
+      if (s.bpAwarded > 0) await award(c, s.uid, s.bpAwarded, 'battle', row.challenge_id);
+      await addWeekXp(c, s.uid, s.xpAwarded ?? 0);
+    }
   });
   return true;
 }

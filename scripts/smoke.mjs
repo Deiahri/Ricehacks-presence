@@ -81,6 +81,17 @@ check('claim second username', (await B.api('POST', '/api/username', { username:
 check('no auth → 401', (await call('', 'GET', '/api/me')).status === 401);
 check('GET /api/me', (await A.api('GET', '/api/me')).body?.username === nameA);
 
+// Weekly XP goal (A only; B never sets one)
+check('new account has no goal', (await A.api('GET', '/api/me')).body?.weeklyGoal === null);
+check('bad goal → 400', (await A.api('POST', '/api/goal', { goal: 5 })).status === 400);
+check('bad tz → 400', (await A.api('POST', '/api/goal', { goal: 40, tz: 'Mars/Olympus' })).status === 400);
+const goal = (await A.api('POST', '/api/goal', { goal: 40, tz: 'America/Chicago' })).body;
+check('set goal 40', goal?.weeklyGoal === 40 && goal.weekXp === 0 && goal.weekMet === false && goal.level === 1 && goal.pendingReward === false
+  && goal.saverDays === 0, JSON.stringify(goal));
+check('goal change is pushed to my tabs', (await A.next('profile', (m) => m.profile.weeklyGoal === 40)).profile.weekXp === 0);
+check('spin with nothing owed → 409', (await A.api('POST', '/api/reward/spin')).body?.error === 'no-reward');
+check('progress without a goal', (await B.api('GET', '/api/progress')).body?.goal === null);
+
 // Identity verification: on when the server has PERSONA_API_KEY. Smoke accounts never verify, so with it on they are
 // unverified and kept off the global board.
 const verifyStart = await A.api('GET', '/api/verify/start');
@@ -146,7 +157,7 @@ A.send({
   track: { v: 1, fps: 10, joints: 13, aspect: 0.56, mirrored: true, frames: 'not base64!' },
 });
 const early = await A.next('saved');
-check('instant solo result earns 0 BP', early.ok === true && early.bpAwarded === 0, JSON.stringify(early));
+check('instant solo result earns 0 BP and 0 XP', early.ok === true && early.bpAwarded === 0 && early.xpAwarded === 0, JSON.stringify(early));
 A.send({ type: 'status', busy: false });
 await sleep(100);
 A.send({ type: 'status', busy: true });
@@ -159,6 +170,9 @@ const soloDetail = Array.from({ length: 15 }, (_, i) => ({ t: i + 0.9, d: 0.9, s
 A.send({ type: 'solo_result', exercise: 'squat', durationS: 15, repScores: Array(15).fill(100), repDetail: soloDetail, track: soloTrack });
 const solo = await A.next('saved');
 check('15 s solo: BP = score (150)', solo.bpAwarded === 150 && solo.bp === 150, JSON.stringify(solo));
+check('15 s solo: 15 perfect reps = 30 XP, goal (40) not met yet', solo.xpAwarded === 30 && solo.goalMet === false, JSON.stringify(solo));
+const afterSolo = await A.next('profile', (m) => m.profile.weekXp === 30);
+check('profile push carries the week XP', afterSolo.profile.weekMet === false && afterSolo.profile.level === 1);
 check('saved carries the workout id', typeof solo.workoutId === 'string' && typeof early.workoutId === 'string');
 A.send({ type: 'status', busy: false });
 
@@ -212,6 +226,8 @@ B.send({ type: 'challenge_final', challengeId: cid, repScores: Array(4).fill(50)
 const [rA, rB] = await Promise.all([A.next('challenge_result'), B.next('challenge_result')]);
 check('winner gets score + 50', rA.winnerId === A.id && rA.you.bpAwarded === 100, JSON.stringify(rA.you));
 check('loser gets score + 0', rB.you.bpAwarded === 20, JSON.stringify(rB.you));
+check('battle XP: 5 perfect reps = 10, 4 so-so reps = 4', rA.you.xpAwarded === 10 && rA.opponent.xpAwarded === 4 && rB.you.xpAwarded === 4,
+  JSON.stringify([rA.you.xpAwarded, rB.you.xpAwarded]));
 check('result has the duel: 50 dealt, 6 absorbed by the shield, 14 taken',
   rA.battle?.you.dealt === 50 && rA.battle.you.absorbed === 6 && rA.battle.you.taken === 14 && rB.battle?.opponent.dealt === 50,
   JSON.stringify(rA.battle));
@@ -225,13 +241,32 @@ await sleep(100);
 A.send({ type: 'challenge_cancel', challengeId: cid });
 const fB2 = await B.next('challenge_result');
 check('forfeit: stayer wins with live score + 50', fB2.forfeit && fB2.winnerId === B.id && fB2.you.bpAwarded === 58, JSON.stringify(fB2.you));
-check('forfeit: leaver gets 0', fB2.opponent.bpAwarded === 0);
+check('forfeit: leaver gets 0', fB2.opponent.bpAwarded === 0 && fB2.opponent.xpAwarded === 0);
 
 await sleep(500); // let both battles commit
 const meA = (await A.api('GET', '/api/me')).body;
 const meB = (await B.api('GET', '/api/me')).body;
 check('A balance 0 + 100 + 0 = 100, 1W 1L', meA.bp === 100 && meA.wins === 1 && meA.losses === 1, JSON.stringify(meA));
 check('B balance 20 + 58 = 78, 1W 1L', meB.bp === 78 && meB.wins === 1 && meB.losses === 1, JSON.stringify(meB));
+
+// Weekly goal: A's 30 solo XP + 10 from the battle win reach the 40 XP goal = level 2 and a spin of the wheel
+check('A: 40/40 XP → goal met, level 2, wheel owed', meA.weekXp === 40 && meA.weekMet === true && meA.level === 2 && meA.pendingReward === true,
+  JSON.stringify([meA.weekXp, meA.weekMet, meA.level, meA.pendingReward]));
+check('B: XP without a goal is recorded but no week', meB.weeklyGoal === null && meB.weekXp === 0 && meB.level === 1);
+const spin = await A.api('POST', '/api/reward/spin');
+const rw = spin.body?.reward;
+const paid = rw?.kind === 'bp' ? spin.body.profile.bp === 100 + rw.bp
+  : rw?.kind === 'saver' ? spin.body.profile.saverDays === rw.days
+  : rw?.kind === 'item' ? spin.body.profile.owned.includes(rw.itemId) : false;
+check('spin the wheel: reward paid, nothing owed any more', spin.status === 200 && paid && spin.body.profile.pendingReward === false, JSON.stringify(spin.body));
+console.log(`INFO  wheel: ${JSON.stringify(rw)}`);
+check('spin twice → 409', (await A.api('POST', '/api/reward/spin')).status === 409);
+const prog = (await A.api('GET', '/api/progress')).body;
+const cur = prog?.weeks?.at(-1);
+check('progress: this week met, 1-week streak, level 2, 7 days summing to 40',
+  cur?.current === true && cur.status === 'met' && cur.xp === 40 && cur.goal === 40 && prog.streak === 1 && prog.level === 2
+  && cur.days.length === 7 && cur.days.reduce((n, d) => n + d.xp, 0) === 40 && cur.days.some((d) => d.sets === 2), JSON.stringify(prog));
+check('progress: weeks=1 caps the window', (await A.api('GET', '/api/progress?weeks=1')).body?.weeks?.length === 1);
 const pr = (await A.api('GET', '/api/pr?exercise=squat&durationS=15')).body;
 check('personal record = best of solo and battles', pr?.bestScore === 150 && pr.bestReps === 15, JSON.stringify(pr));
 

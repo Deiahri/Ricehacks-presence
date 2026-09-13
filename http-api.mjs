@@ -4,11 +4,11 @@
 import { accountFor } from './auth.mjs';
 import { allowToken, coachConfigured, mintConversationToken } from './coach.mjs';
 import {
-  HttpError, buyItem, claimUsername, equipItem, getProfile, globalLeaderboard, hasDb, listFriends, listNotifications,
-  markNotificationsRead, markVerified, personalRecord, recentWorkouts, respondFriendRequest, scoreTargets,
-  sendFriendRequest, setAppearance, workoutDetail, workoutSeries,
+  HttpError, buyItem, claimUsername, equipItem, globalLeaderboard, hasDb, listFriends, listNotifications,
+  markNotificationsRead, markVerified, personalRecord, recentWorkouts, refreshProfile, respondFriendRequest, scoreTargets,
+  sendFriendRequest, setAppearance, setWeeklyGoal, spinWheel, weeklyProgress, workoutDetail, workoutSeries,
 } from './db.mjs';
-import { COSMETICS, DURATIONS, SKIN_TONES, USERNAME_RE } from './game-config.mjs';
+import { COSMETICS, DURATIONS, GOAL_MAX, GOAL_MIN, SKIN_TONES, USERNAME_RE } from './game-config.mjs';
 import { userRecap, workoutAdvice } from './insights.mjs';
 import { INQUIRY_ID, fetchInquiry, inquiryVerdict, personaConfigured } from './persona.mjs';
 
@@ -16,6 +16,8 @@ const MAX_BODY = 4 * 1024;
 const ORIGINS = (process.env.ALLOWED_ORIGINS ?? '*').split(',').map((s) => s.trim()).filter(Boolean);
 const EXERCISES = new Set(['squat', 'pushup']);
 const HEX = /^#[0-9a-f]{6}$/i;
+/** An IANA zone name as the app reports it (Postgres decides whether it exists). */
+const TZ = /^[A-Za-z0-9_+\-/]{1,64}$/;
 
 function cors(req) {
   const origin = req.headers.origin;
@@ -95,7 +97,30 @@ export function createApi(live) {
   };
 
   const routes = {
-    'GET /api/me': async ({ uid }) => pub(await getProfile(uid)),
+    'GET /api/me': async ({ uid }) => pub(await refreshProfile(uid)),
+
+    // Weekly XP goal: an integer GOAL_MIN..GOAL_MAX, with the zone the week is counted in (kept if omitted).
+    'POST /api/goal': async ({ uid, body }) => {
+      const goal = Number(body.goal);
+      if (!Number.isInteger(goal) || goal < GOAL_MIN || goal > GOAL_MAX) throw new HttpError(400, 'bad-goal');
+      const tz = typeof body.tz === 'string' && TZ.test(body.tz) ? body.tz : null;
+      const profile = await setWeeklyGoal(uid, goal, tz);
+      live.patchUser(uid, profile);
+      return pub(profile);
+    },
+
+    // The last `weeks` weeks (1–52, default 12) with a day-by-day XP breakdown, plus the streak and banked savers.
+    'GET /api/progress': async ({ uid, url }) => {
+      const n = Number(url.searchParams.get('weeks') ?? 12);
+      return weeklyProgress(uid, Number.isInteger(n) ? Math.min(52, Math.max(1, n)) : 12);
+    },
+
+    // Spin the wheel owed for a met week. 409 no-reward when none is owed.
+    'POST /api/reward/spin': async ({ uid }) => {
+      const { reward, profile } = await spinWheel(uid);
+      live.patchUser(uid, profile);
+      return { reward, profile: pub(profile) };
+    },
 
     'POST /api/appearance': async ({ uid, body }) => {
       const skin = body.skin === undefined || body.skin === null ? null : String(body.skin);

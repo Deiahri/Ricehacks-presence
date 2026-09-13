@@ -26,24 +26,27 @@ Set `DATABASE_URL` in the server's environment. To run locally, copy `.env.examp
 
 | Table | What's in it |
 |---|---|
-| `users` | One row per account: `auth_sub` (the Clerk user id) or, without Clerk, `device_secret` (the random id the app keeps in localStorage, never broadcast). Also the unique case-insensitive `username`, `shirt`, `skin` (tone id), `bp` and `equipped` (`{slot: itemId}`). `id` is the key everything else points at |
+| `users` | One row per account: `auth_sub` (the Clerk user id) or, without Clerk, `device_secret` (the random id the app keeps in localStorage, never broadcast). Also the unique case-insensitive `username`, `shirt`, `skin` (tone id), `bp`, `equipped` (`{slot: itemId}`), the `weekly_goal` in XP with the `tz` it's counted in and `goal_since`, and banked `saver_days`. `id` is the key everything else points at |
+| `goal_weeks` | One row per week (Monday `week_start`, in the user's zone) since the goal was set: the `goal` at the time, `xp` so far, `met_at`, `extra_days` a streak saver kept it open past Sunday, `closed` once missed for good, and the wheel `reward` once spun |
 | `friend_requests`, `friendships` | Pending requests (from → to) and accepted pairs |
 | `notifications` | What became of a request you sent (`friend_accepted` / `friend_declined`, with the `actor`), and when you read it |
 | `user_items` | Owned cosmetics |
-| `bp_ledger` | Every BP change (`solo`, `battle`, `purchase`). Unique per (user, reason, ref), so an award can't be paid twice |
+| `bp_ledger` | Every BP change (`solo`, `battle`, `purchase`, `wheel`). Unique per (user, reason, ref), so an award can't be paid twice |
 | `workouts` | One row per finished set, below |
 
 | `workouts` column | Meaning |
 |---|---|
 | `mode` | `solo` or `challenge` |
 | `exercise`, `duration_s` | `squat` / `pushup`; `15` / `30` / `60` / `120` / `300` |
-| `user_uid`, `user_name`, `score`, `reps`, `avg_form`, `rep_scores`, `user_bp` | The player (for a battle, the challenger) and the BP they earned. `score` = round(Σ `rep_scores` ÷ 10) |
+| `user_uid`, `user_name`, `score`, `reps`, `avg_form`, `rep_scores`, `user_bp`, `user_xp` | The player (for a battle, the challenger) and the BP and weekly XP they earned. `score` = round(Σ `rep_scores` ÷ 10) |
 | `challenge_id`, `opponent_*` | Battle only: the challenged player's side, in the same row. Null for solo |
 | `winner_uid` | The winner's account, or null on a draw or solo |
 | `forfeit` | The loser left mid-set |
 | `user_id`, `opponent_id`, `winner_id` | The device secrets, kept from before accounts existed. A device's old rows are attached to its account when the account is created |
 
 **BP:** a solo set earns its score, but only once per workout and only if the set's full length has passed since the workout began. A battle earns your score plus 50 for a win, 20 for a draw or 0 for a loss. Leaving mid-set earns 0.
+
+**XP and the weekly goal:** every rep of a set that earned BP is 1 XP, and a rep at 80+ form ("perfect") is 2. Each account sets one goal: the XP to reach between Monday and Sunday in its own zone, however it's spread over the week. Reaching it is a level-up (`level` = 1 + weeks met), the star on the map turns gold and a spin of the reward wheel is owed (`POST /api/reward/spin`): a 1- or 2-day streak saver, +10/+20/+50 BP, or an unowned cosmetic. A saver day keeps an unfinished week open one more day past Sunday (spent as the days pass, whether or not the app is opened); a set on such a day counts for both that week and the new one. Rules and wheel weights live in `game-config.mjs`; the week bookkeeping in `progress.mjs`.
 
 ```sql
 SELECT created_at, mode, exercise, duration_s, user_name, score, user_bp, opponent_name, opponent_score, opponent_bp
@@ -53,6 +56,7 @@ FROM workouts ORDER BY created_at DESC LIMIT 20;
 To check a change end to end, run the server against a throwaway database, without `CLERK_SECRET_KEY`, and run `npm run smoke`. It drives three fake players through:
 - usernames, friends, and the accept/decline notifications
 - looks, BP and the shop
+- the weekly XP goal, level-up and reward wheel
 - two battles
 - the leaderboard and score targets
 
@@ -123,8 +127,8 @@ Every battle message after the request carries `challengeId`. The server ignores
 | Vote (90 s) | `challenge_pick {exercise, durationS}` | both, once both voted: `challenge_resolved {exercise, durationS, picks, coinFlips}` |
 | Cameras (60 s) | `challenge_ready` when the pose model is running | both, once both ready: `challenge_go {countdownMs: 10000, durationS, hpMax, loadouts}` (`loadouts` = each player's battle items, keyed by `id`) |
 | Set | `challenge_rep {reps, score, quality, formScore}` per rep | opponent: `challenge_opp {reps, score, quality}`; both: `challenge_hp {hpMax, you, opponent, event}` |
-| End | `challenge_final {repScores, repDetail?, track?}` | both: `challenge_result {you, opponent, winnerId, forfeit, battle, workoutId}` (each side has `bpAwarded`), then one row stored |
-| Solo | `solo_result {exercise, durationS, repScores, repDetail?, track?}` | `saved {ok, reason?, bpAwarded, bp, workoutId}` (`reason`: `no-db` or `error`) |
+| End | `challenge_final {repScores, repDetail?, track?}` | both: `challenge_result {you, opponent, winnerId, forfeit, battle, workoutId}` (each side has `bpAwarded` and `xpAwarded`), then one row stored |
+| Solo | `solo_result {exercise, durationS, repScores, repDetail?, track?}` | `saved {ok, reason?, bpAwarded, bp, workoutId, xpAwarded, goalMet}` (`reason`: `no-db` or `error`) |
 
 - `challenge_update.status` is one of `declined`, `cancelled`, `timeout`, `busy`, `offline` or `left`.
 - The final score is recomputed on the server from `repScores`. Live values are clamped to what's plausible for the duration.
@@ -162,7 +166,10 @@ Every route takes `Authorization: Bearer <credential>`: a Clerk session token, o
 
 | Route | Does |
 |---|---|
-| `GET /api/me` | `{username, shirt, skin, bp, level, wins, losses, equipped, owned}` |
+| `GET /api/me` | `{username, shirt, skin, bp, level, wins, losses, equipped, owned, verified, weeklyGoal, weekXp, weekMet, saverDays, pendingReward, extension}`. `weeklyGoal` is null until set; `extension` is `{weekStart, xp, goal, daysLeft}` while a saver day keeps last week open, else null |
+| `POST /api/goal {goal, tz?}` | Set the weekly XP goal (10–1000) and the IANA zone the week is counted in. 400 `bad-goal` / `bad-tz` |
+| `GET /api/progress?weeks=` | The last `weeks` weeks (default 12): `{goal, today, thisWeek, streak, saverDays, level, pendingReward, weeks: [{start, goal, xp, status, extraDays, current, days: [{date, xp, sets}]}]}`. `status` is `open`, `met` or `missed` |
+| `POST /api/reward/spin` | Spin the wheel owed for a met week: `{reward: {kind: "saver" \| "bp" \| "item", days? \| bp? \| itemId?}, profile}`. 409 `no-reward` |
 | `POST /api/username {username}` | Claim or rename: 3–16 letters, digits or `_`. 409 `taken` |
 | `POST /api/appearance {skin?, shirt?}` | Free look change: `skin` is a tone id `s1`–`s8`, `shirt` a `#rrggbb` colour. 400 `bad-skin` / `bad-shirt` |
 | `GET /api/notifications` | `{items: [{id, type, createdAt, read, actor}], unread}`, the latest 30 |
