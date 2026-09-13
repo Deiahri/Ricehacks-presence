@@ -7,8 +7,27 @@ export const DURATIONS = new Set([15, 30, 60, 120, 300]);
 /** Battle points. Solo: score × soloPerScorePoint. Battle: score + the outcome bonus. A forfeiter gets `forfeit`. */
 export const REWARDS = { soloPerScorePoint: 1, win: 50, draw: 20, loss: 0, forfeit: 0 };
 export const STARTING_BP = 0;
-/** Lifetime BP earned per level (level 1 at 0). */
-export const BP_PER_LEVEL = 200;
+
+/**
+ * Weekly XP goal. Every counted rep is 1 XP; a rep at XP_PERFECT_AT+ form (the app's green "Great!") is 2. The week
+ * runs Monday→Sunday in the user's zone, and reaching the goal is a level-up: the star on the map turns gold and a spin
+ * of the reward wheel is owed. A streak-saver day keeps an unfinished week open one more day past Sunday.
+ * The app mirrors these in src/game/xp.ts.
+ */
+export const XP_PERFECT_AT = 80;
+export const GOAL_MIN = 10;
+export const GOAL_MAX = 1000;
+export const xpForRep = (form) => (form >= XP_PERFECT_AT ? 2 : 1);
+export const xpForScores = (scores) => scores.reduce((n, s) => n + xpForRep(s), 0);
+/** Reward wheel wedges in display order; `weight` is the relative chance. The app draws the same wheel. */
+export const WHEEL = [
+  { id: 'saver1', kind: 'saver', days: 1, weight: 30 },
+  { id: 'bp10', kind: 'bp', bp: 10, weight: 25 },
+  { id: 'saver2', kind: 'saver', days: 2, weight: 15 },
+  { id: 'bp20', kind: 'bp', bp: 20, weight: 20 },
+  { id: 'item', kind: 'item', weight: 3 },
+  { id: 'bp50', kind: 'bp', bp: 50, weight: 7 },
+];
 
 export const USERNAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 
@@ -47,4 +66,3 @@ export const soloBp = (score) => Math.max(0, Math.round(score * REWARDS.soloPerS
 /** outcome: 'win' | 'loss' | 'draw'. `surge` = the magic wand fired this battle. */
 export const battleBp = (score, outcome, forfeited, surge = false) =>
   forfeited ? REWARDS.forfeit : Math.max(0, score) + REWARDS[outcome] + (surge ? ITEM_EFFECTS.magic_wand.surgeBp : 0);
-export const levelFor = (earned) => 1 + Math.floor(Math.max(0, earned) / BP_PER_LEVEL);
