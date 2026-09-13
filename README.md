@@ -26,8 +26,9 @@ Set `DATABASE_URL` in the server's environment. To run locally, copy `.env.examp
 
 | Table | What's in it |
 |---|---|
-| `users` | One row per device: `device_secret` (the random id the app keeps in localStorage, never broadcast), the unique case-insensitive `username`, `bp`, and `equipped` (`{slot: itemId}`). `id` is the key everything else points at, so a future sign-in provider can map onto the same row |
+| `users` | One row per account: `auth_sub` (the Clerk user id) or, without Clerk, `device_secret` (the random id the app keeps in localStorage, never broadcast). Also the unique case-insensitive `username`, `shirt`, `skin` (tone id), `bp` and `equipped` (`{slot: itemId}`). `id` is the key everything else points at |
 | `friend_requests`, `friendships` | Pending requests (from → to) and accepted pairs |
+| `notifications` | What became of a request you sent (`friend_accepted` / `friend_declined`, with the `actor`), and when you read it |
 | `user_items` | Owned cosmetics |
 | `bp_ledger` | Every BP change (`solo`, `battle`, `purchase`). Unique per (user, reason, ref), so an award can't be paid twice |
 | `workouts` | One row per finished set, below |
@@ -49,7 +50,22 @@ SELECT created_at, mode, exercise, duration_s, user_name, score, user_bp, oppone
 FROM workouts ORDER BY created_at DESC LIMIT 20;
 ```
 
-To check a change end to end, run the server against a throwaway database and `npm run smoke`, which drives two fake players through usernames, friends, BP, the shop and two battles. It creates users and never deletes them, so don't point it at production.
+To check a change end to end, run the server against a throwaway database, without `CLERK_SECRET_KEY`, and run `npm run smoke`. It drives three fake players through:
+- usernames, friends, and the accept/decline notifications
+- looks, BP and the shop
+- two battles
+- the leaderboard and score targets
+
+It creates users and never deletes them, so don't point it at production.
+
+## Sign-in (Clerk)
+
+Set `CLERK_SECRET_KEY` (and optionally `CLERK_AUTHORIZED_PARTIES`, the app's origins) to require Google sign-in. With it set:
+- every `/api` call must send `Authorization: Bearer <Clerk session token>`
+- every socket hello must carry that token as `token`
+- the account is the `users` row whose `auth_sub` is the token's user id, created on first sign-in
+
+A missing, bad or expired token gets 401 `bad-token`; a hello without a valid token still shows on the map, but has no account. Without the key (local dev, the smoke test, `fake-walker`), the device secret is the credential, as before. The frontend README covers setting up the Clerk app.
 
 ## Voice coach (ElevenLabs)
 
@@ -85,13 +101,14 @@ On the free tier the service sleeps after about 15 minutes without traffic. The 
 
 | Direction | Message |
 |---|---|
-| client → server | `{"type":"hello","id","userId","name","shirt"}` once per connection. `id` is per tab; `userId` is stable per device |
+| client → server | `{"type":"hello","id","userId","name","shirt","token"?}` once per connection. `id` is per tab; `userId` is stable per device; `token` is the Clerk session token (required for an account when Clerk is on) |
 | client → server | `{"type":"pos","lat","lng","heading"(deg or null),"acc"}`, at most 4×/s, and every 20 s while still |
 | client → server | `{"type":"status","busy"}`: in a solo workout, so challenges are refused |
 | server → client | `{"type":"you","id"}` after hello |
-| server → client | `{"type":"profile","profile":{username,shirt,bp,level,wins,losses,equipped,owned}}` after hello, and whenever BP, gear or the username changes |
+| server → client | `{"type":"profile","profile":{username,shirt,skin,bp,level,wins,losses,equipped,owned}}` after hello, and whenever BP, looks, gear or the username changes |
 | server → client | `{"type":"friend_request"}` / `{"type":"friend_update"}`: refetch `/api/friends` |
-| server → client | `{"type":"players","players":[{id,name,username,shirt,equipped,lat,lng,heading,acc,ts,busy}]}`, up to 5×/s, only when something changed |
+| server → client | `{"type":"notification","notification":{id,type,createdAt,read,actor}}`: someone accepted or declined your friend request (also in `/api/notifications`) |
+| server → client | `{"type":"players","players":[{id,name,username,shirt,skin,equipped,lat,lng,heading,acc,ts,busy}]}`, up to 5×/s, only when something changed |
 
 Players disappear from the map after 60 s without a position, and are removed when their socket closes. A ping every 25 s drops dead sockets.
 
@@ -116,12 +133,17 @@ Every battle message after the request carries `challengeId`. The server ignores
 
 ## JSON API
 
-Every route takes `Authorization: Bearer <device secret>` (the app's `presence.userId`); the account is created on first use. Errors come back as `{"error": "<reason>"}`. CORS is open unless `ALLOWED_ORIGINS` lists specific origins.
+Every route takes `Authorization: Bearer <credential>`: a Clerk session token, or without Clerk the device secret (the app's `presence.userId`). The account is created on first use. Errors come back as `{"error": "<reason>"}`. CORS is open unless `ALLOWED_ORIGINS` lists specific origins.
 
 | Route | Does |
 |---|---|
-| `GET /api/me` | `{username, shirt, bp, level, wins, losses, equipped, owned}` |
+| `GET /api/me` | `{username, shirt, skin, bp, level, wins, losses, equipped, owned}` |
 | `POST /api/username {username}` | Claim or rename: 3–16 letters, digits or `_`. 409 `taken` |
+| `POST /api/appearance {skin?, shirt?}` | Free look change: `skin` is a tone id `s1`–`s8`, `shirt` a `#rrggbb` colour. 400 `bad-skin` / `bad-shirt` |
+| `GET /api/notifications` | `{items: [{id, type, createdAt, read, actor}], unread}`, the latest 30 |
+| `POST /api/notifications/read` | Mark them all read |
+| `GET /api/leaderboard` | `{entries, me}`: everyone with a username, ranked by their best single-set score (any exercise or length; people with no sets share the last rank). Top 100, plus your own `{rank, bestScore}` |
+| `GET /api/targets?exercise=&durationS=&opponent=` | Scores to beat for that set, for the coach: `{personal, global, friends, opponent}`, each `{score, reps, username?}` or null |
 | `GET /api/friends` | `{friends, incoming, outgoing}`; friends also have `online`, `busy` and `presenceId` (the id to send `challenge_request` to) |
 | `POST /api/friends/requests {username}` | `{status: "sent"}`, or `"accepted"` if they had already asked you. 404 `not-found`, 409 `already-friends`, 400 `self` / `no-username` |
 | `POST /api/friends/respond {username, accept}` | Accept or decline their request |

@@ -87,6 +87,24 @@ ALTER TABLE workouts
 CREATE INDEX IF NOT EXISTS workouts_uid_pr_idx ON workouts (user_uid, exercise, duration_s);
 CREATE INDEX IF NOT EXISTS workouts_opp_uid_pr_idx ON workouts (opponent_uid, exercise, duration_s);
 CREATE INDEX IF NOT EXISTS workouts_winner_uid_idx ON workouts (winner_uid);
+
+-- Sign-in: a Clerk user id owns one row. device_secret is only used without Clerk (local dev, the smoke test).
+ALTER TABLE users ALTER COLUMN device_secret DROP NOT NULL;
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS auth_sub text,
+  ADD COLUMN IF NOT EXISTS skin     text;
+CREATE UNIQUE INDEX IF NOT EXISTS users_auth_sub_key ON users (auth_sub);
+
+-- What happened to friend requests I sent.
+CREATE TABLE IF NOT EXISTS notifications (
+  id         bigserial PRIMARY KEY,
+  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type       text NOT NULL CHECK (type IN ('friend_accepted', 'friend_declined')),
+  actor      uuid REFERENCES users(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  read_at    timestamptz
+);
+CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications (user_id, created_at DESC);
 `;
 
 const COLUMNS = [
@@ -192,8 +210,24 @@ export async function ensureUser(secret, shirt = null) {
   return id;
 }
 
+const uidBySub = new Map();
+
+/** The user row for a signed-in (Clerk) user id, created on first sight. Resolves to its id. */
+export async function ensureAuthUser(sub, shirt = null) {
+  const cached = uidBySub.get(sub);
+  if (cached) return cached;
+  const { rows } = await q(
+    `INSERT INTO users (auth_sub, shirt, bp) VALUES ($1, $2, $3)
+     ON CONFLICT (auth_sub) DO UPDATE SET shirt = COALESCE(users.shirt, EXCLUDED.shirt)
+     RETURNING id`,
+    [sub, shirt, STARTING_BP],
+  );
+  uidBySub.set(sub, rows[0].id);
+  return rows[0].id;
+}
+
 const PROFILE_SELECT = `
-  SELECT u.id, u.username, u.shirt, u.bp, u.equipped,
+  SELECT u.id, u.username, u.shirt, u.skin, u.bp, u.equipped,
     ARRAY(SELECT item_id FROM user_items WHERE user_id = u.id ORDER BY acquired_at) AS owned,
     (SELECT COALESCE(sum(delta), 0) FROM bp_ledger WHERE user_id = u.id AND delta > 0)::int AS earned,
     (SELECT count(*) FROM workouts WHERE winner_uid = u.id)::int AS wins,
@@ -202,7 +236,7 @@ const PROFILE_SELECT = `
   FROM users u WHERE u.id = ANY($1::uuid[])`;
 
 const toProfile = (r) => ({
-  id: r.id, username: r.username, shirt: r.shirt, bp: r.bp, equipped: r.equipped ?? {}, owned: r.owned,
+  id: r.id, username: r.username, shirt: r.shirt, skin: r.skin, bp: r.bp, equipped: r.equipped ?? {}, owned: r.owned,
   wins: r.wins, losses: r.losses, level: levelFor(r.earned),
 });
 
@@ -230,6 +264,12 @@ export async function claimUsername(uid, username) {
   return getProfile(uid);
 }
 
+/** Change skin tone and/or shirt colour (null keeps the current one). Values are validated by the caller. */
+export async function setAppearance(uid, { skin, shirt }) {
+  await q('UPDATE users SET skin = COALESCE($2, skin), shirt = COALESCE($3, shirt) WHERE id = $1', [uid, skin, shirt]);
+  return getProfile(uid);
+}
+
 async function uidOfUsername(client, username) {
   const { rows } = await client.query('SELECT id FROM users WHERE lower(username) = lower($1)', [username]);
   return rows[0]?.id ?? null;
@@ -245,7 +285,16 @@ async function requireUsername(client, uid) {
 
 const pair = (x, y) => (x < y ? [x, y] : [y, x]);
 
-/** Resolves { status: 'sent' | 'accepted', to: uid }. A request to someone who already asked you accepts theirs. */
+/** Tell `uid` what `actor` did with their request. Resolves the notification id. */
+async function notify(c, uid, type, actor) {
+  const { rows } = await c.query('INSERT INTO notifications (user_id, type, actor) VALUES ($1, $2, $3) RETURNING id', [uid, type, actor]);
+  return rows[0].id;
+}
+
+/**
+ * Resolves { status: 'sent' | 'accepted', to: uid, notification?: id }. A request to someone who already asked you
+ * accepts theirs (and tells them so).
+ */
 export function sendFriendRequest(uid, username) {
   return withTx(async (c) => {
     await requireUsername(c, uid);
@@ -258,14 +307,14 @@ export function sendFriendRequest(uid, username) {
     const reverse = await c.query('DELETE FROM friend_requests WHERE from_user = $1 AND to_user = $2', [to, uid]);
     if (reverse.rowCount) {
       await c.query('INSERT INTO friendships (user_a, user_b) VALUES ($1, $2) ON CONFLICT DO NOTHING', [a, b]);
-      return { status: 'accepted', to };
+      return { status: 'accepted', to, notification: await notify(c, to, 'friend_accepted', uid) };
     }
     await c.query('INSERT INTO friend_requests (from_user, to_user) VALUES ($1, $2) ON CONFLICT DO NOTHING', [uid, to]);
     return { status: 'sent', to };
   });
 }
 
-/** Accept or decline `username`'s request to `uid`. Resolves the requester's id. */
+/** Accept or decline `username`'s request to `uid`, and tell them. Resolves { from: requester id, notification: id }. */
 export function respondFriendRequest(uid, username, accept) {
   return withTx(async (c) => {
     const from = await uidOfUsername(c, username);
@@ -275,8 +324,27 @@ export function respondFriendRequest(uid, username, accept) {
     if (accept) {
       await c.query('INSERT INTO friendships (user_a, user_b) VALUES ($1, $2) ON CONFLICT DO NOTHING', pair(uid, from));
     }
-    return from;
+    return { from, notification: await notify(c, from, accept ? 'friend_accepted' : 'friend_declined', uid) };
   });
+}
+
+// --- notifications --------------------------------------------------------------
+
+/** My latest notifications (or just one, by id), newest first: { id, type, createdAt, read, actor: profile | null }. */
+export async function listNotifications(uid, onlyId = null) {
+  const { rows } = await q(
+    `SELECT id, type, actor, created_at, read_at FROM notifications
+     WHERE user_id = $1 AND ($2::bigint IS NULL OR id = $2) ORDER BY created_at DESC, id DESC LIMIT 30`,
+    [uid, onlyId],
+  );
+  const actors = new Map((await profiles([...new Set(rows.map((r) => r.actor).filter(Boolean))])).map((p) => [p.id, p]));
+  return rows.map((r) => ({
+    id: Number(r.id), type: r.type, createdAt: r.created_at, read: r.read_at !== null, actor: actors.get(r.actor) ?? null,
+  }));
+}
+
+export async function markNotificationsRead(uid) {
+  await q('UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL', [uid]);
 }
 
 /** Profiles of my friends plus pending requests both ways (each includes its `id`). */
@@ -353,6 +421,72 @@ export async function personalRecord(uid, exercise, durationS) {
     [uid, exercise, durationS],
   );
   return { bestScore: rows[0].best_score, bestReps: rows[0].best_reps };
+}
+
+/** Every stored set as (uid, score, reps, exercise, duration_s, created_at), from either side of a battle. */
+const ALL_SETS = `
+  SELECT user_uid AS uid, score, reps, exercise, duration_s, created_at FROM workouts WHERE user_uid IS NOT NULL
+  UNION ALL
+  SELECT opponent_uid, opponent_score, opponent_reps, exercise, duration_s, created_at FROM workouts
+  WHERE opponent_uid IS NOT NULL AND opponent_score IS NOT NULL`;
+
+/** The best set for one exercise + length, among `uids` (null = everyone). { score, reps, username } or null. */
+async function topSet(exercise, durationS, uids) {
+  const { rows } = await q(
+    `SELECT s.score, s.reps, u.username FROM (${ALL_SETS}) s JOIN users u ON u.id = s.uid
+     WHERE s.exercise = $1 AND s.duration_s = $2 AND ($3::uuid[] IS NULL OR s.uid = ANY($3::uuid[]))
+     ORDER BY s.score DESC, s.reps DESC, s.created_at LIMIT 1`,
+    [exercise, durationS, uids],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Scores to beat for one exercise + set length (for the coach): my best, the best on the server, the best among my
+ * friends, and — given a username — that opponent's best. Each is { score, reps, username? } or null.
+ */
+export async function scoreTargets(uid, exercise, durationS, opponentUsername = null) {
+  const opponentId = async () =>
+    (await q('SELECT id FROM users WHERE lower(username) = lower($1)', [opponentUsername])).rows[0]?.id ?? null;
+  const [mine, global, friends, opponent] = await Promise.all([
+    personalRecord(uid, exercise, durationS),
+    topSet(exercise, durationS, null),
+    friendIds(uid).then((ids) => (ids.length ? topSet(exercise, durationS, ids) : null)),
+    opponentUsername ? opponentId().then((id) => (id ? topSet(exercise, durationS, [id]) : null)) : null,
+  ]);
+  const personal = mine.bestScore === null ? null : { score: mine.bestScore, reps: mine.bestReps };
+  return { personal, global, friends, opponent };
+}
+
+/**
+ * The global leaderboard: everyone with a username, ranked by their best single set (any exercise or length).
+ * People with no sets are included and share the last rank. Resolves { entries (top `limit`), me: { rank, bestScore } }.
+ */
+export async function globalLeaderboard(uid, limit = 100) {
+  const { rows } = await q(
+    `WITH best AS (
+       SELECT DISTINCT ON (uid) uid, score, reps, exercise, duration_s FROM (${ALL_SETS}) s
+       ORDER BY uid, score DESC, created_at
+     ), ranked AS (
+       SELECT u.id, b.score, b.reps, b.exercise, b.duration_s,
+         rank() OVER (ORDER BY b.score DESC NULLS LAST) AS rank,
+         row_number() OVER (ORDER BY b.score DESC NULLS LAST, lower(u.username)) AS pos
+       FROM users u LEFT JOIN best b ON b.uid = u.id
+       WHERE u.username IS NOT NULL
+     )
+     SELECT * FROM ranked WHERE pos <= $2 OR id = $1 ORDER BY pos`,
+    [uid, limit],
+  );
+  const byId = new Map((await profiles(rows.map((r) => r.id))).map((p) => [p.id, p]));
+  const entries = rows.filter((r) => Number(r.pos) <= limit).map((r) => {
+    const p = byId.get(r.id);
+    return {
+      rank: Number(r.rank), username: p.username, shirt: p.shirt, skin: p.skin, equipped: p.equipped, level: p.level,
+      bestScore: r.score, bestReps: r.reps, exercise: r.exercise, durationS: r.duration_s, isMe: r.id === uid,
+    };
+  });
+  const mine = rows.find((r) => r.id === uid);
+  return { entries, me: mine ? { rank: Number(mine.rank), bestScore: mine.score } : null };
 }
 
 /** Pay an award once. Resolves the user's new balance, or null if this award was already paid. */

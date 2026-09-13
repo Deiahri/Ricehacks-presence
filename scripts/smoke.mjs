@@ -96,6 +96,33 @@ const fB = friendsA?.friends?.find((f) => f.username === nameB);
 check('friend listed, online, with presence id', fB?.online === true && fB.presenceId === B.id, JSON.stringify(friendsA));
 check('already friends → 409', (await A.api('POST', '/api/friends/requests', { username: nameB })).status === 409);
 
+// Request outcomes reach the sender: pushed live and kept in their inbox
+const accepted = await A.next('notification');
+check('sender is pushed "accepted"', accepted.notification?.type === 'friend_accepted' && accepted.notification.actor?.username === nameB,
+  JSON.stringify(accepted));
+const inboxA = (await A.api('GET', '/api/notifications')).body;
+check('inbox has it, unread', inboxA?.unread === 1 && inboxA.items[0]?.type === 'friend_accepted' && !('id' in (inboxA.items[0].actor ?? {})),
+  JSON.stringify(inboxA));
+await A.api('POST', '/api/notifications/read');
+check('mark read clears unread', (await A.api('GET', '/api/notifications')).body?.unread === 0);
+const C = player('c');
+await C.open;
+C.hello();
+await C.next('profile');
+const nameC = `smk_${tag}c`;
+await C.api('POST', '/api/username', { username: nameC });
+await C.api('POST', '/api/friends/requests', { username: nameB });
+check('decline request', (await B.api('POST', '/api/friends/respond', { username: nameC, accept: false })).status === 200);
+const declined = await C.next('notification');
+check('sender is pushed "declined"', declined.notification?.type === 'friend_declined' && declined.notification.actor?.username === nameB,
+  JSON.stringify(declined));
+
+// Appearance
+check('bad skin → 400', (await A.api('POST', '/api/appearance', { skin: 'green' })).status === 400);
+check('bad shirt → 400', (await A.api('POST', '/api/appearance', { shirt: 'red' })).status === 400);
+const look = (await A.api('POST', '/api/appearance', { skin: 's5', shirt: '#12AB34' })).body;
+check('set skin + shirt', look?.skin === 's5' && look.shirt === '#12ab34', JSON.stringify(look));
+
 // Solo BP (anti-spam: an instant result earns nothing)
 A.send({ type: 'status', busy: true });
 await sleep(100);
@@ -124,7 +151,8 @@ check('re-equip', (await A.api('POST', '/api/equip', { slot: 'offhand', itemId: 
 A.send({ type: 'pos', lat: 29.7174, lng: -95.4018, heading: 0, acc: 5 });
 await sleep(600);
 const seen = B.snapshot().find((p) => p.id === A.id);
-check('map snapshot has username + gear', seen?.username === nameA && seen.equipped?.offhand === 'low_tier_shield', JSON.stringify(seen));
+check('map snapshot has username + gear + look',
+  seen?.username === nameA && seen.equipped?.offhand === 'low_tier_shield' && seen.skin === 's5' && seen.shirt === '#12ab34', JSON.stringify(seen));
 
 // 15 s battle, settled by finals: A 5×100 = 50 pts beats B 4×50 = 20 pts
 async function startBattle() {
@@ -168,10 +196,26 @@ check('A balance 0 + 100 + 0 = 100, 1W 1L', meA.bp === 100 && meA.wins === 1 && 
 check('B balance 20 + 58 = 78, 1W 1L', meB.bp === 78 && meB.wins === 1 && meB.losses === 1, JSON.stringify(meB));
 const pr = (await A.api('GET', '/api/pr?exercise=squat&durationS=15')).body;
 check('personal record = best of solo and battles', pr?.bestScore === 150 && pr.bestReps === 15, JSON.stringify(pr));
+
+// Global leaderboard: best single set per person; people without sets are listed last
+const board = (await A.api('GET', '/api/leaderboard')).body;
+const row = (n) => board?.entries?.find((e) => e.username === n);
+check('leaderboard: A best 150, B best 20, C listed with no score',
+  row(nameA)?.bestScore === 150 && row(nameB)?.bestScore === 20 && row(nameC) && row(nameC).bestScore === null, JSON.stringify(board?.entries?.slice(0, 5)));
+check('leaderboard: ranks in order, me = A', row(nameA).rank < row(nameB).rank && row(nameB).rank < row(nameC).rank
+  && row(nameA).isMe && board.me?.rank === row(nameA).rank, JSON.stringify(board?.me));
+
+// Coach targets
+const targets = (await A.api('GET', `/api/targets?exercise=squat&durationS=15&opponent=${nameB}`)).body;
+check('targets: personal, friends (B), opponent (B), global',
+  targets?.personal?.score === 150 && targets.friends?.score === 20 && targets.friends.username === nameB
+  && targets.opponent?.score === 20 && targets.global?.score >= 150, JSON.stringify(targets));
+check('targets: bad set → 400', (await A.api('GET', '/api/targets?exercise=lunge&durationS=15')).status === 400);
 const token = await A.api('GET', '/api/coach/token');
 console.log(`INFO  /api/coach/token → ${token.status}${token.status === 200 ? ' (token received)' : ` ${JSON.stringify(token.body)}`}`);
 
 A.ws.close();
 B.ws.close();
+C.ws.close();
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
 process.exitCode = failures ? 1 : 0;

@@ -3,10 +3,13 @@
 //     npm run coach:agent          # reads ELEVENLABS_API_KEY (and ELEVENLABS_AGENT_ID, if set) from .env
 //
 // With ELEVENLABS_AGENT_ID set, that agent is updated; otherwise an agent named NAME is found or created.
-// Prints the agent id only. Put it in .env and on Render as ELEVENLABS_AGENT_ID.
+// Prints the agent id and writes it to .env as ELEVENLABS_AGENT_ID. On Render, set it in the environment yourself.
 //
 // The prompt, first line and voice here are only defaults: the app overrides them every session from
 // src/config/coach.ts, so edit that file to change how the coach behaves. This script just has to allow those overrides.
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 const API = 'https://api.elevenlabs.io';
 const NAME = 'Ricehacks workout coach';
 const key = process.env.ELEVENLABS_API_KEY;
@@ -19,10 +22,10 @@ const agent = {
   name: NAME,
   conversation_config: {
     agent: {
-      first_message: "Let's get it. I'm watching your form.",
+      first_message: "I'm watching your form. Make it clean.",
       language: 'en',
       prompt: {
-        prompt: 'You are a chill, upbeat workout buddy. Keep every reply to one short sentence.',
+        prompt: 'You are a blunt, tough-love workout coach. Praise only earned reps. Keep every reply to one short sentence.',
         llm: 'gemini-2.0-flash',
       },
     },
@@ -64,3 +67,15 @@ if (id) {
   console.log(`Created agent ${id}`);
 }
 console.log(`ELEVENLABS_AGENT_ID=${id}`);
+
+// Save the id to .env so the server picks it up: replace an existing ELEVENLABS_AGENT_ID line, or append one.
+const envPath = fileURLToPath(new URL('../.env', import.meta.url));
+const env = existsSync(envPath) ? readFileSync(envPath, 'utf8') : '';
+const line = `ELEVENLABS_AGENT_ID=${id}`;
+const next = /^ELEVENLABS_AGENT_ID=.*$/m.test(env)
+  ? env.replace(/^ELEVENLABS_AGENT_ID=.*$/m, line)
+  : `${env}${env && !env.endsWith('\n') ? '\n' : ''}${line}\n`;
+if (next !== env) {
+  writeFileSync(envPath, next);
+  console.log(`Saved to ${envPath}`);
+}

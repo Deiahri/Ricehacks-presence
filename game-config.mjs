@@ -23,6 +23,9 @@ export const COSMETICS = {
 /** Wear an item as soon as it's bought. */
 export const AUTO_EQUIP_ON_BUY = true;
 
+/** Skin tone ids the avatar editor offers (free to change). The colours live in the app's src/config/appearance.ts. */
+export const SKIN_TONES = new Set(['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8']);
+
 export const soloBp = (score) => Math.max(0, Math.round(score * REWARDS.soloPerScorePoint));
 /** outcome: 'win' | 'loss' | 'draw'. */
 export const battleBp = (score, outcome, forfeited) => (forfeited ? REWARDS.forfeit : Math.max(0, score) + REWARDS[outcome]);

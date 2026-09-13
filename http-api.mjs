@@ -1,15 +1,18 @@
-// JSON API for accounts, friends, the shop and the coach, served by the same node:http server as the WebSocket.
-// Auth is `Authorization: Bearer <device secret>` (the app's localStorage id); there are no cookies, so CORS can be open.
+// JSON API for accounts, friends, the shop, leaderboards and the coach, served by the same node:http server as the WebSocket.
+// Auth is `Authorization: Bearer <credential>`: a Clerk session token when CLERK_SECRET_KEY is set, else the device
+// secret (see auth.mjs). There are no cookies, so CORS can be open.
+import { accountFor } from './auth.mjs';
 import { allowToken, coachConfigured, mintConversationToken } from './coach.mjs';
 import {
-  HttpError, buyItem, claimUsername, ensureUser, equipItem, getProfile, hasDb, listFriends, personalRecord,
-  respondFriendRequest, sendFriendRequest,
+  HttpError, buyItem, claimUsername, equipItem, getProfile, globalLeaderboard, hasDb, listFriends, listNotifications,
+  markNotificationsRead, personalRecord, respondFriendRequest, scoreTargets, sendFriendRequest, setAppearance,
 } from './db.mjs';
-import { COSMETICS, DURATIONS, USERNAME_RE } from './game-config.mjs';
+import { COSMETICS, DURATIONS, SKIN_TONES, USERNAME_RE } from './game-config.mjs';
 
 const MAX_BODY = 4 * 1024;
 const ORIGINS = (process.env.ALLOWED_ORIGINS ?? '*').split(',').map((s) => s.trim()).filter(Boolean);
 const EXERCISES = new Set(['squat', 'pushup']);
+const HEX = /^#[0-9a-f]{6}$/i;
 
 function cors(req) {
   const origin = req.headers.origin;
@@ -51,6 +54,15 @@ function readJson(req) {
 
 /** Public view of a profile (no internal id), plus live presence for friends. */
 const pub = ({ id: _id, ...p }) => p;
+const pubNotification = (n) => ({ ...n, actor: n.actor && pub(n.actor) });
+
+/** A set query's exercise + durationS, or 400 bad-set. */
+function setOf(url) {
+  const exercise = url.searchParams.get('exercise');
+  const durationS = Number(url.searchParams.get('durationS'));
+  if (!EXERCISES.has(exercise) || !DURATIONS.has(durationS)) throw new HttpError(400, 'bad-set');
+  return { exercise, durationS };
+}
 
 /**
  * @param {{ presenceOf: (uid: string) => ({ id: string, busy: boolean } | null),
@@ -64,8 +76,24 @@ export function createApi(live) {
     return { ...pub(p), online: presence !== null, busy: presence?.busy ?? false, presenceId: presence?.id ?? null };
   };
 
+  /** Push a stored notification to its owner's open tabs. */
+  const pushNotification = async (uid, id) => {
+    const [n] = await listNotifications(uid, id);
+    if (n) live.pushToUser(uid, { type: 'notification', notification: pubNotification(n) });
+  };
+
   const routes = {
     'GET /api/me': async ({ uid }) => pub(await getProfile(uid)),
+
+    'POST /api/appearance': async ({ uid, body }) => {
+      const skin = body.skin === undefined || body.skin === null ? null : String(body.skin);
+      const shirt = body.shirt === undefined || body.shirt === null ? null : String(body.shirt);
+      if (skin !== null && !SKIN_TONES.has(skin)) throw new HttpError(400, 'bad-skin');
+      if (shirt !== null && !HEX.test(shirt)) throw new HttpError(400, 'bad-shirt');
+      const profile = await setAppearance(uid, { skin, shirt: shirt?.toLowerCase() ?? null });
+      live.patchUser(uid, profile);
+      return pub(profile);
+    },
 
     'POST /api/username': async ({ uid, body }) => {
       const username = typeof body.username === 'string' ? body.username.trim() : '';
@@ -98,25 +126,43 @@ export function createApi(live) {
     'POST /api/friends/requests': async ({ uid, body }) => {
       const username = typeof body.username === 'string' ? body.username.trim() : '';
       if (!USERNAME_RE.test(username)) throw new HttpError(404, 'not-found');
-      const { status, to } = await sendFriendRequest(uid, username);
+      const { status, to, notification } = await sendFriendRequest(uid, username);
       live.pushToUser(to, { type: status === 'accepted' ? 'friend_update' : 'friend_request' });
       live.pushToUser(uid, { type: 'friend_update' });
+      if (notification) await pushNotification(to, notification);
       return { status };
     },
 
     'POST /api/friends/respond': async ({ uid, body }) => {
       const username = typeof body.username === 'string' ? body.username.trim() : '';
-      const from = await respondFriendRequest(uid, username, body.accept === true);
+      const { from, notification } = await respondFriendRequest(uid, username, body.accept === true);
       live.pushToUser(from, { type: 'friend_update' });
       live.pushToUser(uid, { type: 'friend_update' });
+      await pushNotification(from, notification);
       return { ok: true };
     },
 
+    'GET /api/notifications': async ({ uid }) => {
+      const items = (await listNotifications(uid)).map(pubNotification);
+      return { items, unread: items.filter((n) => !n.read).length };
+    },
+
+    'POST /api/notifications/read': async ({ uid }) => {
+      await markNotificationsRead(uid);
+      return { ok: true };
+    },
+
+    'GET /api/leaderboard': async ({ uid }) => globalLeaderboard(uid),
+
     'GET /api/pr': async ({ uid, url }) => {
-      const exercise = url.searchParams.get('exercise');
-      const durationS = Number(url.searchParams.get('durationS'));
-      if (!EXERCISES.has(exercise) || !DURATIONS.has(durationS)) throw new HttpError(400, 'bad-set');
+      const { exercise, durationS } = setOf(url);
       return personalRecord(uid, exercise, durationS);
+    },
+
+    'GET /api/targets': async ({ uid, url }) => {
+      const { exercise, durationS } = setOf(url);
+      const opponent = url.searchParams.get('opponent');
+      return scoreTargets(uid, exercise, durationS, opponent && USERNAME_RE.test(opponent) ? opponent : null);
     },
 
     'GET /api/coach/token': async ({ uid }) => {
@@ -147,9 +193,9 @@ export function createApi(live) {
     }
     try {
       if (!hasDb()) throw new HttpError(503, 'no-db');
-      const auth = /^Bearer (.{4,64})$/.exec(req.headers.authorization ?? '');
+      const auth = /^Bearer (\S{4,4096})$/.exec(req.headers.authorization ?? '');
       if (!auth) throw new HttpError(401, 'no-auth');
-      const uid = await ensureUser(auth[1]);
+      const { uid } = await accountFor(auth[1]);
       const body = req.method === 'POST' ? await readJson(req) : {};
       reply(200, await route({ uid, body, url }));
     } catch (e) {

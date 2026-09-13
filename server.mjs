@@ -7,7 +7,8 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
-import { ensureUser, getProfile, hasDb, initDb, recordChallenge, recordSolo } from './db.mjs';
+import { accountFor, clerkEnabled } from './auth.mjs';
+import { getProfile, hasDb, initDb, recordChallenge, recordSolo } from './db.mjs';
 import { DURATIONS, battleBp } from './game-config.mjs';
 import { createApi } from './http-api.mjs';
 
@@ -26,9 +27,10 @@ const EXERCISES = new Set(['squat', 'pushup']);
 const QUALITIES = new Set(['red', 'yellow', 'green']);
 
 /**
- * `userId` is the device secret from hello (never sent to other clients); `uid` is the account it maps to,
- * filled in once the database answers. `soloSince` = when the current solo workout began.
- * @type {Map<import('ws').WebSocket, {id:string,userId:string,uid:string|null,username:string|null,name:string,shirt:string,equipped:object,lat:number|null,lng:number|null,heading:number|null,acc:number|null,ts:number,soloBusy:boolean,soloSince:number|null}>}
+ * `userId` is the account's stable key (Clerk user id, or the device secret without Clerk; never sent to other clients);
+ * until the account resolves it is the device secret or connection id. `uid` is the account, filled in once the
+ * database answers. `soloSince` = when the current solo workout began.
+ * @type {Map<import('ws').WebSocket, {id:string,userId:string,uid:string|null,username:string|null,name:string,shirt:string,skin:string|null,equipped:object,lat:number|null,lng:number|null,heading:number|null,acc:number|null,ts:number,soloBusy:boolean,soloSince:number|null}>}
  */
 const players = new Map();
 /** Active challenge per socket (both participants point at the same object). */
@@ -55,7 +57,7 @@ const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 const HEX = /^#[0-9a-f]{6}$/i;
 const send = (ws, msg) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg)); };
-const brief = (p) => ({ id: p.id, name: p.name, shirt: p.shirt, equipped: p.equipped });
+const brief = (p) => ({ id: p.id, name: p.name, shirt: p.shirt, skin: p.skin, equipped: p.equipped });
 /** A profile as clients see it (no internal id). */
 const pubProfile = ({ id: _id, ...p }) => p;
 const clampInt = (v, lo, hi) => (isNum(v) ? Math.min(hi, Math.max(lo, Math.round(v))) : lo);
@@ -94,11 +96,13 @@ function presenceOf(uid) {
   return found;
 }
 
-/** A username, purchase or equip changed: update the map snapshot and every tab of that account. */
+/** A username, look, purchase or equip changed: update the map snapshot and every tab of that account. */
 function patchUser(uid, profile) {
   for (const [, p] of connectionsOf(uid)) {
     p.username = profile.username;
     if (profile.username) p.name = profile.username;
+    if (profile.shirt) p.shirt = profile.shirt;
+    p.skin = profile.skin ?? null;
     p.equipped = profile.equipped ?? {};
   }
   dirty = true;
@@ -113,15 +117,18 @@ function notifyProfile(uid) {
   );
 }
 
-/** After hello: find (or create) the account for this device and tell the client who it is. */
-async function resolveAccount(ws, entry) {
+/** After hello: find (or create) the account for this credential and tell the client who it is. */
+async function resolveAccount(ws, entry, credential) {
   try {
-    const uid = await ensureUser(entry.userId, entry.shirt);
+    const { uid, key } = await accountFor(credential, entry.shirt);
     const profile = await getProfile(uid);
     if (players.get(ws) !== entry) return; // closed or said hello again meanwhile
     entry.uid = uid;
+    entry.userId = key;
     entry.username = profile.username;
     if (profile.username) entry.name = profile.username;
+    if (profile.shirt) entry.shirt = profile.shirt;
+    entry.skin = profile.skin ?? null;
     entry.equipped = profile.equipped;
     dirty = true;
     send(ws, { type: 'profile', profile: pubProfile(profile) });
@@ -178,11 +185,11 @@ function finish(ch, forfeitBy = null) {
   if (ch.phase === 'done') return;
   release(ch);
   const side = (ws) => {
-    const { id, userId, uid, name, shirt, equipped } = ch.info.get(ws);
+    const { id, userId, uid, name, shirt, skin, equipped } = ch.info.get(ws);
     const f = ch.finals.get(ws);
-    if (f) return { id, userId, uid, name, shirt, equipped, reps: f.length, score: totalScore(f), repScores: f };
+    if (f) return { id, userId, uid, name, shirt, skin, equipped, reps: f.length, score: totalScore(f), repScores: f };
     const l = ch.live.get(ws) ?? { reps: 0, score: 0 }; // never sent a final: last live update
-    return { id, userId, uid, name, shirt, equipped, reps: l.reps, score: l.score, repScores: [] };
+    return { id, userId, uid, name, shirt, skin, equipped, reps: l.reps, score: l.score, repScores: [] };
   };
   const A = side(ch.a);
   const B = side(ch.b);
@@ -344,8 +351,12 @@ wss.on('connection', (ws) => {
       if (typeof msg.id !== 'string' || msg.id.length < 4 || msg.id.length > 64) return;
       const name = typeof msg.name === 'string' ? msg.name.trim().slice(0, 24) : '';
       const userId = typeof msg.userId === 'string' && msg.userId.length >= 4 && msg.userId.length <= 64 ? msg.userId : msg.id;
+      // With Clerk the account comes from the session token; without it, from the device secret. No credential
+      // (bots, or signed out) = on the map without an account.
+      const token = typeof msg.token === 'string' && msg.token.length >= 4 && msg.token.length <= 4096 ? msg.token : null;
+      const credential = clerkEnabled() ? token : userId;
       const prev = players.get(ws);
-      const same = prev?.userId === userId;
+      const same = !clerkEnabled() && prev?.userId === userId;
       const entry = {
         id: msg.id,
         userId,
@@ -353,6 +364,7 @@ wss.on('connection', (ws) => {
         username: same ? prev.username : null,
         name: (same && prev.username) || name || 'Player',
         shirt: typeof msg.shirt === 'string' && HEX.test(msg.shirt) ? msg.shirt : '#7fb0e0',
+        skin: same ? prev.skin : null,
         equipped: same ? prev.equipped : {},
         lat: prev?.lat ?? null, lng: prev?.lng ?? null, heading: prev?.heading ?? null, acc: prev?.acc ?? null,
         ts: Date.now(),
@@ -362,7 +374,7 @@ wss.on('connection', (ws) => {
       players.set(ws, entry);
       ws.send(JSON.stringify({ type: 'you', id: msg.id }));
       dirty = true;
-      if (hasDb()) void resolveAccount(ws, entry);
+      if (hasDb() && credential) void resolveAccount(ws, entry, credential);
       return;
     }
 
@@ -415,7 +427,7 @@ setInterval(() => {
   for (const [ws, p] of players) {
     if (p.lat === null) continue;
     list.push({
-      id: p.id, name: p.name, username: p.username, shirt: p.shirt, equipped: p.equipped,
+      id: p.id, name: p.name, username: p.username, shirt: p.shirt, skin: p.skin, equipped: p.equipped,
       lat: p.lat, lng: p.lng, heading: p.heading, acc: p.acc, ts: p.ts,
       busy: p.soloBusy || challengeOf.has(ws),
     });
