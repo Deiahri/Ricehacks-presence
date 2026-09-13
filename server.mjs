@@ -24,7 +24,7 @@ const READY_TIMEOUT_MS = 60_000; // both cameras must be running
 const COUNTDOWN_MS = 10_000; // "get in position" before counting starts
 const FINAL_GRACE_MS = 15_000; // wait this long past the end for both final scores
 
-const EXERCISES = new Set(['squat', 'pushup']);
+const EXERCISES = new Set(['squat', 'pushup', 'pullup']);
 const QUALITIES = new Set(['red', 'yellow', 'green']);
 
 /**

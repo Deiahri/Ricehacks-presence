@@ -37,7 +37,7 @@ Set `DATABASE_URL` in the server's environment. To run locally, copy `.env.examp
 | `workouts` column | Meaning |
 |---|---|
 | `mode` | `solo` or `challenge` |
-| `exercise`, `duration_s` | `squat` / `pushup`; `15` / `30` / `60` / `120` / `300` |
+| `exercise`, `duration_s` | `squat` / `pushup` / `pullup`; `15` / `30` / `60` / `120` / `300` |
 | `user_uid`, `user_name`, `score`, `reps`, `avg_form`, `rep_scores`, `user_bp`, `user_xp` | The player (for a battle, the challenger) and the BP and weekly XP they earned. `score` = round(Σ `rep_scores` ÷ 10) |
 | `challenge_id`, `opponent_*` | Battle only: the challenged player's side, in the same row. Null for solo |
 | `winner_uid` | The winner's account, or null on a draw or solo |

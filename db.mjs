@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS workouts (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   created_at     timestamptz NOT NULL DEFAULT now(),
   mode           text NOT NULL CHECK (mode IN ('solo', 'challenge')),
-  exercise       text NOT NULL CHECK (exercise IN ('squat', 'pushup')),
+  exercise       text NOT NULL CHECK (exercise IN ('squat', 'pushup', 'pullup')),
   duration_s     integer NOT NULL,
   user_id        text NOT NULL,
   user_name      text NOT NULL,
@@ -186,6 +186,9 @@ CREATE INDEX IF NOT EXISTS workouts_opponent_uid_idx ON workouts (opponent_uid, 
 -- The wheel pays BP too.
 ALTER TABLE bp_ledger DROP CONSTRAINT IF EXISTS bp_ledger_reason_check;
 ALTER TABLE bp_ledger ADD CONSTRAINT bp_ledger_reason_check CHECK (reason IN ('solo', 'battle', 'purchase', 'grant', 'wheel'));
+-- Pull-ups became playable, and CREATE TABLE IF NOT EXISTS never revisits an existing table.
+ALTER TABLE workouts DROP CONSTRAINT IF EXISTS workouts_exercise_check;
+ALTER TABLE workouts ADD CONSTRAINT workouts_exercise_check CHECK (exercise IN ('squat', 'pushup', 'pullup'));
 `;
 
 const COLUMNS = [

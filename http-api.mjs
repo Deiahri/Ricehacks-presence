@@ -14,7 +14,7 @@ import { INQUIRY_ID, fetchInquiry, inquiryVerdict, personaConfigured } from './p
 
 const MAX_BODY = 4 * 1024;
 const ORIGINS = (process.env.ALLOWED_ORIGINS ?? '*').split(',').map((s) => s.trim()).filter(Boolean);
-const EXERCISES = new Set(['squat', 'pushup']);
+const EXERCISES = new Set(['squat', 'pushup', 'pullup']);
 const HEX = /^#[0-9a-f]{6}$/i;
 /** An IANA zone name as the app reports it (Postgres decides whether it exists). */
 const TZ = /^[A-Za-z0-9_+\-/]{1,64}$/;

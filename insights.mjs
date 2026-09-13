@@ -10,7 +10,7 @@ import { allowGeneration, geminiConfigured, geminiModel, generateJson } from './
 /** A recap is rewritten after a new workout, or when it gets this old (so "you've been slacking" can show up). */
 const RECAP_MAX_AGE_MS = 3 * 86_400_000;
 const DAY_MS = 86_400_000;
-const EXERCISE = { squat: 'squats', pushup: 'push-ups' };
+const EXERCISE = { squat: 'squats', pushup: 'push-ups', pullup: 'pull-ups' };
 
 const SYSTEM = `You are the NextRep workout coach: upbeat, direct, specific and a little playful.
 You receive JSON stats about bodyweight sets scored by a phone camera. Each rep gets a form score 0-100
@@ -100,6 +100,9 @@ const SUB_TIPS = {
   symmetry: 'Drive evenly through both sides; film yourself side-on to spot the lean.',
   body_line: 'Brace your core and squeeze your glutes so your body stays one straight line.',
   lockout: 'Straighten your arms fully at the top of every push-up.',
+  height: 'Pull until your chin clears the bar on every rep.',
+  dead_hang: 'Come back to straight arms at the bottom; half pull-ups do not count.',
+  control: 'Stop the swing: no kipping, keep your legs quiet.',
 };
 
 function fallbackAdvice(f) {
