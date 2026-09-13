@@ -31,7 +31,7 @@ const QUALITIES = new Set(['red', 'yellow', 'green']);
  * `userId` is the account's stable key (Clerk user id, or the device secret without Clerk; never sent to other clients);
  * until the account resolves it is the device secret or connection id. `uid` is the account, filled in once the
  * database answers. `soloSince` = when the current solo workout began.
- * @type {Map<import('ws').WebSocket, {id:string,userId:string,uid:string|null,username:string|null,name:string,shirt:string,skin:string|null,equipped:object,lat:number|null,lng:number|null,heading:number|null,acc:number|null,ts:number,soloBusy:boolean,soloSince:number|null}>}
+ * @type {Map<import('ws').WebSocket, {id:string,userId:string,uid:string|null,username:string|null,name:string,shirt:string,skin:string|null,equipped:object,verified:boolean|null,lat:number|null,lng:number|null,heading:number|null,acc:number|null,ts:number,soloBusy:boolean,soloSince:number|null}>}
  */
 const players = new Map();
 /** Active challenge per socket (both participants point at the same object). */
@@ -146,6 +146,7 @@ function patchUser(uid, profile) {
     if (profile.shirt) p.shirt = profile.shirt;
     p.skin = profile.skin ?? null;
     p.equipped = profile.equipped ?? {};
+    p.verified = profile.verified !== false;
   }
   dirty = true;
   pushToUser(uid, { type: 'profile', profile: pubProfile(profile) });
@@ -172,6 +173,7 @@ async function resolveAccount(ws, entry, credential) {
     if (profile.shirt) entry.shirt = profile.shirt;
     entry.skin = profile.skin ?? null;
     entry.equipped = profile.equipped;
+    entry.verified = profile.verified !== false;
     dirty = true;
     send(ws, { type: 'profile', profile: pubProfile(profile) });
   } catch (e) {
@@ -456,6 +458,7 @@ wss.on('connection', (ws) => {
         shirt: typeof msg.shirt === 'string' && HEX.test(msg.shirt) ? msg.shirt : '#7fb0e0',
         skin: same ? prev.skin : null,
         equipped: same ? prev.equipped : {},
+        verified: same ? prev.verified : null, // null = not known yet (no account, or still looking it up)
         lat: prev?.lat ?? null, lng: prev?.lng ?? null, heading: prev?.heading ?? null, acc: prev?.acc ?? null,
         ts: Date.now(),
         soloBusy: prev?.soloBusy ?? false,
@@ -517,7 +520,7 @@ setInterval(() => {
   for (const [ws, p] of players) {
     if (p.lat === null) continue;
     list.push({
-      id: p.id, name: p.name, username: p.username, shirt: p.shirt, skin: p.skin, equipped: p.equipped,
+      id: p.id, name: p.name, username: p.username, shirt: p.shirt, skin: p.skin, equipped: p.equipped, verified: p.verified,
       lat: p.lat, lng: p.lng, heading: p.heading, acc: p.acc, ts: p.ts,
       busy: p.soloBusy || challengeOf.has(ws),
     });

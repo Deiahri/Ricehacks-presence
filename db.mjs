@@ -2,6 +2,7 @@
 // and is never logged. Without it (local dev) nothing is stored and the /api routes answer 503, so the relay still runs.
 import pg from 'pg';
 import { AUTO_EQUIP_ON_BUY, COSMETICS, SLOTS, STARTING_BP, battleBp, levelFor, soloBp } from './game-config.mjs';
+import { personaConfigured } from './persona.mjs';
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS workouts (
@@ -145,6 +146,12 @@ CREATE TABLE IF NOT EXISTS user_recaps (
   model             text NOT NULL,
   created_at        timestamptz NOT NULL DEFAULT now()
 );
+
+-- Identity (Persona): verified_at is set once an inquiry for this account passes. One inquiry verifies one account.
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS verified_at     timestamptz,
+  ADD COLUMN IF NOT EXISTS persona_inquiry text;
+CREATE UNIQUE INDEX IF NOT EXISTS users_persona_inquiry_key ON users (persona_inquiry);
 `;
 
 const COLUMNS = [
@@ -283,7 +290,7 @@ export async function ensureAuthUser(sub, shirt = null) {
 }
 
 const PROFILE_SELECT = `
-  SELECT u.id, u.username, u.shirt, u.skin, u.bp, u.equipped,
+  SELECT u.id, u.username, u.shirt, u.skin, u.bp, u.equipped, u.verified_at,
     ARRAY(SELECT item_id FROM user_items WHERE user_id = u.id ORDER BY acquired_at) AS owned,
     (SELECT COALESCE(sum(delta), 0) FROM bp_ledger WHERE user_id = u.id AND delta > 0)::int AS earned,
     (SELECT count(*) FROM workouts WHERE winner_uid = u.id)::int AS wins,
@@ -294,6 +301,8 @@ const PROFILE_SELECT = `
 const toProfile = (r) => ({
   id: r.id, username: r.username, shirt: r.shirt, skin: r.skin, bp: r.bp, equipped: r.equipped ?? {}, owned: r.owned,
   wins: r.wins, losses: r.losses, level: levelFor(r.earned),
+  // Verification off (no Persona key) = everyone counts as verified.
+  verified: !personaConfigured() || r.verified_at !== null,
 });
 
 async function profiles(ids) {
@@ -315,6 +324,20 @@ export async function claimUsername(uid, username) {
   } catch (e) {
     if (e.code === '23505') throw new HttpError(409, 'taken');
     if (e.code === '23514') throw new HttpError(400, 'invalid');
+    throw e;
+  }
+  return getProfile(uid);
+}
+
+/** Mark `uid` verified by a passed Persona inquiry (checked by the caller). 409 inquiry-used if another account used it. */
+export async function markVerified(uid, inquiryId) {
+  try {
+    await q(
+      'UPDATE users SET verified_at = COALESCE(verified_at, now()), persona_inquiry = COALESCE(persona_inquiry, $2) WHERE id = $1',
+      [uid, inquiryId],
+    );
+  } catch (e) {
+    if (e.code === '23505') throw new HttpError(409, 'inquiry-used');
     throw e;
   }
   return getProfile(uid);
@@ -611,13 +634,17 @@ const ALL_SETS = `
   SELECT opponent_uid, opponent_score, opponent_reps, exercise, duration_s, created_at FROM workouts
   WHERE opponent_uid IS NOT NULL AND opponent_score IS NOT NULL`;
 
-/** The best set for one exercise + length, among `uids` (null = everyone). { score, reps, username } or null. */
-async function topSet(exercise, durationS, uids) {
+/**
+ * The best set for one exercise + length, among `uids` (null = everyone; `verifiedOnly` = only verified accounts).
+ * { score, reps, username } or null.
+ */
+async function topSet(exercise, durationS, uids, verifiedOnly = false) {
   const { rows } = await q(
     `SELECT s.score, s.reps, u.username FROM (${ALL_SETS}) s JOIN users u ON u.id = s.uid
      WHERE s.exercise = $1 AND s.duration_s = $2 AND ($3::uuid[] IS NULL OR s.uid = ANY($3::uuid[]))
+       AND (NOT $4::boolean OR u.verified_at IS NOT NULL)
      ORDER BY s.score DESC, s.reps DESC, s.created_at LIMIT 1`,
-    [exercise, durationS, uids],
+    [exercise, durationS, uids, verifiedOnly],
   );
   return rows[0] ?? null;
 }
@@ -631,7 +658,7 @@ export async function scoreTargets(uid, exercise, durationS, opponentUsername = 
     (await q('SELECT id FROM users WHERE lower(username) = lower($1)', [opponentUsername])).rows[0]?.id ?? null;
   const [mine, global, friends, opponent] = await Promise.all([
     personalRecord(uid, exercise, durationS),
-    topSet(exercise, durationS, null),
+    topSet(exercise, durationS, null, personaConfigured()), // the global best only counts verified accounts
     friendIds(uid).then((ids) => (ids.length ? topSet(exercise, durationS, ids) : null)),
     opponentUsername ? opponentId().then((id) => (id ? topSet(exercise, durationS, [id]) : null)) : null,
   ]);
@@ -640,10 +667,12 @@ export async function scoreTargets(uid, exercise, durationS, opponentUsername = 
 }
 
 /**
- * The global leaderboard: everyone with a username, ranked by their best single set (any exercise or length).
- * People with no sets are included and share the last rank. Resolves { entries (top `limit`), me: { rank, bestScore } }.
+ * The global leaderboard: everyone verified with a username, ranked by their best single set (any exercise or length).
+ * People with no sets are included and share the last rank. Resolves { entries (top `limit`), me }, where me is
+ * { rank, bestScore, verified: true }, or { rank: null, bestScore: null, verified: false } for an unverified viewer.
  */
 export async function globalLeaderboard(uid, limit = 100) {
+  const verifiedOnly = personaConfigured();
   const { rows } = await q(
     `WITH best AS (
        SELECT DISTINCT ON (uid) uid, score, reps, exercise, duration_s FROM (${ALL_SETS}) s
@@ -653,10 +682,10 @@ export async function globalLeaderboard(uid, limit = 100) {
          rank() OVER (ORDER BY b.score DESC NULLS LAST) AS rank,
          row_number() OVER (ORDER BY b.score DESC NULLS LAST, lower(u.username)) AS pos
        FROM users u LEFT JOIN best b ON b.uid = u.id
-       WHERE u.username IS NOT NULL
+       WHERE u.username IS NOT NULL AND (NOT $3::boolean OR u.verified_at IS NOT NULL)
      )
      SELECT * FROM ranked WHERE pos <= $2 OR id = $1 ORDER BY pos`,
-    [uid, limit],
+    [uid, limit, verifiedOnly],
   );
   const byId = new Map((await profiles(rows.map((r) => r.id))).map((p) => [p.id, p]));
   const entries = rows.filter((r) => Number(r.pos) <= limit).map((r) => {
@@ -667,7 +696,9 @@ export async function globalLeaderboard(uid, limit = 100) {
     };
   });
   const mine = rows.find((r) => r.id === uid);
-  return { entries, me: mine ? { rank: Number(mine.rank), bestScore: mine.score } : null };
+  if (mine) return { entries, me: { rank: Number(mine.rank), bestScore: mine.score, verified: true } };
+  const unverified = verifiedOnly && !(await q('SELECT 1 FROM users WHERE id = $1 AND verified_at IS NOT NULL', [uid])).rowCount;
+  return { entries, me: unverified ? { rank: null, bestScore: null, verified: false } : null };
 }
 
 /** Pay an award once. Resolves the user's new balance, or null if this award was already paid. */

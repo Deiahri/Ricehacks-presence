@@ -5,11 +5,12 @@ import { accountFor } from './auth.mjs';
 import { allowToken, coachConfigured, mintConversationToken } from './coach.mjs';
 import {
   HttpError, buyItem, claimUsername, equipItem, getProfile, globalLeaderboard, hasDb, listFriends, listNotifications,
-  markNotificationsRead, personalRecord, recentWorkouts, respondFriendRequest, scoreTargets, sendFriendRequest,
-  setAppearance, workoutDetail, workoutSeries,
+  markNotificationsRead, markVerified, personalRecord, recentWorkouts, respondFriendRequest, scoreTargets,
+  sendFriendRequest, setAppearance, workoutDetail, workoutSeries,
 } from './db.mjs';
 import { COSMETICS, DURATIONS, SKIN_TONES, USERNAME_RE } from './game-config.mjs';
 import { userRecap, workoutAdvice } from './insights.mjs';
+import { INQUIRY_ID, fetchInquiry, inquiryVerdict, personaConfigured } from './persona.mjs';
 
 const MAX_BODY = 4 * 1024;
 const ORIGINS = (process.env.ALLOWED_ORIGINS ?? '*').split(',').map((s) => s.trim()).filter(Boolean);
@@ -110,6 +111,32 @@ export function createApi(live) {
       const username = typeof body.username === 'string' ? body.username.trim() : '';
       if (!USERNAME_RE.test(username)) throw new HttpError(400, 'invalid');
       const profile = await claimUsername(uid, username);
+      live.patchUser(uid, profile);
+      return pub(profile);
+    },
+
+    // Identity verification: the app starts Persona's flow with this reference id, then hands back the inquiry id,
+    // which is checked with Persona before the account counts as verified.
+    'GET /api/verify/start': async ({ uid }) => {
+      if (!personaConfigured()) throw new HttpError(503, 'persona-not-configured');
+      return { referenceId: uid };
+    },
+
+    'POST /api/verify': async ({ uid, body }) => {
+      if (!personaConfigured()) throw new HttpError(503, 'persona-not-configured');
+      const inquiryId = typeof body.inquiryId === 'string' ? body.inquiryId.trim() : '';
+      if (!INQUIRY_ID.test(inquiryId)) throw new HttpError(400, 'bad-inquiry');
+      let inquiry;
+      try {
+        inquiry = await fetchInquiry(inquiryId);
+      } catch (e) {
+        console.error('[persona] inquiry lookup failed:', e.message);
+        throw new HttpError(502, 'persona-unavailable');
+      }
+      if (!inquiry) throw new HttpError(404, 'no-inquiry');
+      const verdict = inquiryVerdict(inquiry, uid);
+      if (!verdict.ok) throw new HttpError(verdict.reason === 'not-yours' ? 403 : 409, verdict.reason);
+      const profile = await markVerified(uid, inquiryId);
       live.patchUser(uid, profile);
       return pub(profile);
     },

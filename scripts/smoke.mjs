@@ -81,6 +81,20 @@ check('claim second username', (await B.api('POST', '/api/username', { username:
 check('no auth → 401', (await call('', 'GET', '/api/me')).status === 401);
 check('GET /api/me', (await A.api('GET', '/api/me')).body?.username === nameA);
 
+// Identity verification: on when the server has PERSONA_API_KEY. Smoke accounts never verify, so with it on they are
+// unverified and kept off the global board.
+const verifyStart = await A.api('GET', '/api/verify/start');
+const PERSONA_ON = verifyStart.status === 200;
+console.log(`INFO  identity verification is ${PERSONA_ON ? 'ON (PERSONA_API_KEY set)' : 'off'}`);
+check('profile.verified: true only while verification is off', (await A.api('GET', '/api/me')).body?.verified === !PERSONA_ON);
+if (PERSONA_ON) {
+  check('verify/start hands back a reference id', typeof verifyStart.body?.referenceId === 'string' && verifyStart.body.referenceId.length > 8);
+  check('verify: bad inquiry id → 400', (await A.api('POST', '/api/verify', { inquiryId: '../nope' })).status === 400);
+} else {
+  check('verify/start → 503 without Persona', verifyStart.status === 503 && verifyStart.body?.error === 'persona-not-configured');
+  check('verify → 503 without Persona', (await A.api('POST', '/api/verify', { inquiryId: 'inq_abcdef123' })).status === 503);
+}
+
 // Friends
 const sent = await A.api('POST', '/api/friends/requests', { username: nameB });
 check('friend request sent', sent.body?.status === 'sent', JSON.stringify(sent));
@@ -161,8 +175,9 @@ check('re-equip', (await A.api('POST', '/api/equip', { slot: 'offhand', itemId: 
 A.send({ type: 'pos', lat: 29.7174, lng: -95.4018, heading: 0, acc: 5 });
 await sleep(600);
 const seen = B.snapshot().find((p) => p.id === A.id);
-check('map snapshot has username + gear + look',
-  seen?.username === nameA && seen.equipped?.offhand === 'low_tier_shield' && seen.skin === 's5' && seen.shirt === '#12ab34', JSON.stringify(seen));
+check('map snapshot has username + gear + look + verified flag',
+  seen?.username === nameA && seen.equipped?.offhand === 'low_tier_shield' && seen.skin === 's5' && seen.shirt === '#12ab34'
+  && seen.verified === !PERSONA_ON, JSON.stringify(seen));
 
 // 15 s battle, settled by finals: A 5×100 = 50 pts beats B 4×50 = 20 pts
 async function startBattle() {
@@ -271,16 +286,22 @@ check('recap: nothing to say without workouts', (await C.api('GET', '/api/recap'
 // Global leaderboard: best single set per person; people without sets are listed last
 const board = (await A.api('GET', '/api/leaderboard')).body;
 const row = (n) => board?.entries?.find((e) => e.username === n);
-check('leaderboard: A best 150, B best 20, C listed with no score',
-  row(nameA)?.bestScore === 150 && row(nameB)?.bestScore === 20 && row(nameC) && row(nameC).bestScore === null, JSON.stringify(board?.entries?.slice(0, 5)));
-check('leaderboard: ranks in order, me = A', row(nameA).rank < row(nameB).rank && row(nameB).rank < row(nameC).rank
-  && row(nameA).isMe && board.me?.rank === row(nameA).rank, JSON.stringify(board?.me));
+if (PERSONA_ON) {
+  check('leaderboard: unverified players are not listed', !row(nameA) && !row(nameB) && !row(nameC), JSON.stringify(board?.entries?.slice(0, 5)));
+  check('leaderboard: me = unverified, unranked', board?.me?.verified === false && board.me.rank === null, JSON.stringify(board?.me));
+} else {
+  check('leaderboard: A best 150, B best 20, C listed with no score',
+    row(nameA)?.bestScore === 150 && row(nameB)?.bestScore === 20 && row(nameC) && row(nameC).bestScore === null, JSON.stringify(board?.entries?.slice(0, 5)));
+  check('leaderboard: ranks in order, me = A', row(nameA).rank < row(nameB).rank && row(nameB).rank < row(nameC).rank
+    && row(nameA).isMe && board.me?.rank === row(nameA).rank && board.me.verified === true, JSON.stringify(board?.me));
+}
 
-// Coach targets
+// Coach targets (the global best only counts verified players)
 const targets = (await A.api('GET', `/api/targets?exercise=squat&durationS=15&opponent=${nameB}`)).body;
+const globalOk = PERSONA_ON ? !targets?.global?.username?.startsWith(`smk_${tag}`) : targets?.global?.score >= 150;
 check('targets: personal, friends (B), opponent (B), global',
   targets?.personal?.score === 150 && targets.friends?.score === 20 && targets.friends.username === nameB
-  && targets.opponent?.score === 20 && targets.global?.score >= 150, JSON.stringify(targets));
+  && targets.opponent?.score === 20 && globalOk, JSON.stringify(targets));
 check('targets: bad set → 400', (await A.api('GET', '/api/targets?exercise=lunge&durationS=15')).status === 400);
 const token = await A.api('GET', '/api/coach/token');
 console.log(`INFO  /api/coach/token → ${token.status}${token.status === 200 ? ' (token received)' : ` ${JSON.stringify(token.body)}`}`);
