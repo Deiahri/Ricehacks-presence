@@ -18,7 +18,7 @@ The frontend's dev server (`npm run dev` in Ricehacks-mybuild) connects to `ws:/
 
 ## Workout storage (Tiger Cloud / Postgres)
 
-Set `DATABASE_URL` in the server's environment. On Render, add it under the Web Service's **Environment** settings. On boot the server creates the `workouts` table if it doesn't exist (see `db.mjs`). Without `DATABASE_URL` the server still runs: it logs `[db] skipped …`, and solo players see "not saved". The URL is never logged.
+Set `DATABASE_URL` in the server's environment. To run locally, copy `.env.example` to `.env`, fill it in, and start the server with `node --env-file=.env server.mjs`. `.env` is git-ignored. On Render, add it under the Web Service's **Environment** settings. On boot the server creates the `workouts` table if it doesn't exist (see `db.mjs`). Without `DATABASE_URL` the server still runs: it logs `[db] skipped …`, and solo players see "not saved". The URL is never logged.
 
 | Column | Meaning |
 |---|---|

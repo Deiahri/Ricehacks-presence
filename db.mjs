@@ -33,8 +33,19 @@ const COLUMNS = [
 ];
 const INSERT = `INSERT INTO workouts (${COLUMNS.join(', ')}) VALUES (${COLUMNS.map((_, i) => `$${i + 1}`).join(', ')})`;
 
+// Tiger Cloud connection strings say sslmode=require, meaning libpq's "encrypt, don't verify": their CA
+// (ca.timescale.com) is private, so it isn't in Node's trust store. pg 8 treats require as verify-full and rejects
+// that chain, so opt into libpq semantics. A URL that picks its own mode (e.g. verify-full + sslrootcert) is untouched.
+function pgUrl(raw) {
+  const url = new URL(raw);
+  if (url.searchParams.get('sslmode') === 'require' && !url.searchParams.has('uselibpqcompat')) {
+    url.searchParams.set('uselibpqcompat', 'true');
+  }
+  return url.toString();
+}
+
 const pool = process.env.DATABASE_URL
-  ? new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 3, idleTimeoutMillis: 30_000 })
+  ? new pg.Pool({ connectionString: pgUrl(process.env.DATABASE_URL), max: 3, idleTimeoutMillis: 30_000 })
   : null;
 pool?.on('error', (e) => console.error('[db] idle client error:', e.message));
 
