@@ -2,11 +2,14 @@
 // Every client says hello, streams its position, and receives a snapshot of everyone.
 // Challenges (request → accept → pick → ready → live → result) are refereed here so both phones agree on the
 // exercise, the start moment and the winner, and each result is stored exactly once.
-// State is in memory only — restart = empty world. Good enough for a spike.
+// Accounts, friends, BP and the shop are in Postgres (db.mjs) behind a small JSON API (http-api.mjs).
+// Live state is in memory only — restart = empty world. Good enough for a spike.
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
-import { initDb, saveWorkout } from './db.mjs';
+import { ensureUser, getProfile, hasDb, initDb, recordChallenge, recordSolo } from './db.mjs';
+import { DURATIONS, battleBp } from './game-config.mjs';
+import { createApi } from './http-api.mjs';
 
 const PORT = Number(process.env.PORT ?? 8787);
 const BROADCAST_MS = 200; // snapshot at most 5×/s, only when something changed
@@ -20,14 +23,19 @@ const COUNTDOWN_MS = 10_000; // "get in position" before counting starts
 const FINAL_GRACE_MS = 15_000; // wait this long past the end for both final scores
 
 const EXERCISES = new Set(['squat', 'pushup']);
-const DURATIONS = new Set([30, 60, 120, 300]);
 const QUALITIES = new Set(['red', 'yellow', 'green']);
 
-/** @type {Map<import('ws').WebSocket, {id:string,userId:string,name:string,shirt:string,lat:number|null,lng:number|null,heading:number|null,acc:number|null,ts:number,soloBusy:boolean}>} */
+/**
+ * `userId` is the device secret from hello (never sent to other clients); `uid` is the account it maps to,
+ * filled in once the database answers. `soloSince` = when the current solo workout began.
+ * @type {Map<import('ws').WebSocket, {id:string,userId:string,uid:string|null,username:string|null,name:string,shirt:string,equipped:object,lat:number|null,lng:number|null,heading:number|null,acc:number|null,ts:number,soloBusy:boolean,soloSince:number|null}>}
+ */
 const players = new Map();
 /** Active challenge per socket (both participants point at the same object). */
 const challengeOf = new Map();
 let dirty = false;
+
+const api = createApi({ presenceOf, patchUser, pushToUser });
 
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
@@ -35,7 +43,10 @@ const server = http.createServer((req, res) => {
     res.end(`ok ${players.size}\n`);
     return;
   }
-  res.writeHead(404).end();
+  api(req, res).then(
+    (handled) => { if (!handled) res.writeHead(404).end(); },
+    (e) => { console.error('[api] unhandled:', e.message); if (!res.headersSent) res.writeHead(500).end(); },
+  );
 });
 
 // A 5-minute set's final message carries up to ~450 rep scores.
@@ -44,7 +55,9 @@ const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 const HEX = /^#[0-9a-f]{6}$/i;
 const send = (ws, msg) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg)); };
-const brief = (p) => ({ id: p.id, name: p.name, shirt: p.shirt });
+const brief = (p) => ({ id: p.id, name: p.name, shirt: p.shirt, equipped: p.equipped });
+/** A profile as clients see it (no internal id). */
+const pubProfile = ({ id: _id, ...p }) => p;
 const clampInt = (v, lo, hi) => (isNum(v) ? Math.min(hi, Math.max(lo, Math.round(v))) : lo);
 /** Same formula as the app's src/game/scoring.ts: each rep is worth 0-10 points by form. */
 const totalScore = (scores) => Math.round(scores.reduce((s, v) => s + v, 0) / 10);
@@ -61,6 +74,60 @@ function socketOf(id) {
   let found = null;
   for (const [ws, p] of players) if (p.id === id) found = ws; // newest connection wins
   return found;
+}
+
+// --- accounts ---------------------------------------------------------------
+
+/** Every open connection signed in as account `uid` (one per tab or phone). */
+function* connectionsOf(uid) {
+  for (const [ws, p] of players) if (p.uid === uid) yield [ws, p];
+}
+
+function pushToUser(uid, msg) {
+  for (const [ws] of connectionsOf(uid)) send(ws, msg);
+}
+
+/** Where to reach `uid` for a challenge: its newest connection, or null when offline. */
+function presenceOf(uid) {
+  let found = null;
+  for (const [ws, p] of connectionsOf(uid)) found = { id: p.id, busy: p.soloBusy || challengeOf.has(ws) };
+  return found;
+}
+
+/** A username, purchase or equip changed: update the map snapshot and every tab of that account. */
+function patchUser(uid, profile) {
+  for (const [, p] of connectionsOf(uid)) {
+    p.username = profile.username;
+    if (profile.username) p.name = profile.username;
+    p.equipped = profile.equipped ?? {};
+  }
+  dirty = true;
+  pushToUser(uid, { type: 'profile', profile: pubProfile(profile) });
+}
+
+/** BP changed after a set: send the fresh profile to that account's tabs. */
+function notifyProfile(uid) {
+  getProfile(uid).then(
+    (profile) => pushToUser(uid, { type: 'profile', profile: pubProfile(profile) }),
+    (e) => console.error('[db] profile refresh failed:', e.message),
+  );
+}
+
+/** After hello: find (or create) the account for this device and tell the client who it is. */
+async function resolveAccount(ws, entry) {
+  try {
+    const uid = await ensureUser(entry.userId, entry.shirt);
+    const profile = await getProfile(uid);
+    if (players.get(ws) !== entry) return; // closed or said hello again meanwhile
+    entry.uid = uid;
+    entry.username = profile.username;
+    if (profile.username) entry.name = profile.username;
+    entry.equipped = profile.equipped;
+    dirty = true;
+    send(ws, { type: 'profile', profile: pubProfile(profile) });
+  } catch (e) {
+    console.error('[db] account lookup failed:', e.message);
+  }
 }
 
 // --- challenges -------------------------------------------------------------
@@ -106,16 +173,16 @@ function abort(ch, status) {
   for (const ws of [ch.a, ch.b]) send(ws, { type: 'challenge_update', challengeId: ch.id, status });
 }
 
-/** Score a live challenge, tell both players, store one row. `forfeitBy` = the socket that left early. */
+/** Score a live challenge, pay BP, tell both players, store one row. `forfeitBy` = the socket that left early. */
 function finish(ch, forfeitBy = null) {
   if (ch.phase === 'done') return;
   release(ch);
   const side = (ws) => {
-    const { id, userId, name, shirt } = ch.info.get(ws);
+    const { id, userId, uid, name, shirt, equipped } = ch.info.get(ws);
     const f = ch.finals.get(ws);
-    if (f) return { id, userId, name, shirt, reps: f.length, score: totalScore(f), repScores: f };
+    if (f) return { id, userId, uid, name, shirt, equipped, reps: f.length, score: totalScore(f), repScores: f };
     const l = ch.live.get(ws) ?? { reps: 0, score: 0 }; // never sent a final: last live update
-    return { id, userId, name, shirt, reps: l.reps, score: l.score, repScores: [] };
+    return { id, userId, uid, name, shirt, equipped, reps: l.reps, score: l.score, repScores: [] };
   };
   const A = side(ch.a);
   const B = side(ch.b);
@@ -124,17 +191,28 @@ function finish(ch, forfeitBy = null) {
   else if (A.score !== B.score) winner = A.score > B.score ? A : B;
   else if (A.reps !== B.reps) winner = A.reps > B.reps ? A : B;
 
-  const pub = ({ userId: _userId, ...rest }) => rest;
+  // Only accounts can hold BP, so a side the database never resolved earns nothing.
+  const forfeiter = forfeitBy ? (forfeitBy === ch.a ? A : B) : null;
+  for (const S of [A, B]) {
+    const outcome = winner === null ? 'draw' : winner === S ? 'win' : 'loss';
+    S.bpAwarded = S.uid ? battleBp(S.score, outcome, S === forfeiter) : 0;
+  }
+
+  const pub = ({ userId: _userId, uid: _uid, ...rest }) => rest;
   const base = { type: 'challenge_result', challengeId: ch.id, winnerId: winner?.id ?? null, forfeit: Boolean(forfeitBy) };
   send(ch.a, { ...base, you: pub(A), opponent: pub(B) });
   send(ch.b, { ...base, you: pub(B), opponent: pub(A) });
 
-  saveWorkout({
+  recordChallenge({
     mode: 'challenge', exercise: ch.config.exercise, duration_s: ch.config.durationS,
     user_id: A.userId, user_name: A.name, score: A.score, reps: A.reps, avg_form: avgForm(A.repScores), rep_scores: A.repScores,
     challenge_id: ch.id, opponent_id: B.userId, opponent_name: B.name, opponent_score: B.score, opponent_reps: B.reps,
     winner_id: winner?.userId ?? null, forfeit: Boolean(forfeitBy),
-  }).catch((e) => console.error('[db] challenge save failed:', e.message));
+    user_uid: A.uid, opponent_uid: B.uid, winner_uid: winner?.uid ?? null, user_bp: A.bpAwarded, opponent_bp: B.bpAwarded,
+  }, [A, B]).then(
+    (stored) => { if (stored) for (const S of [A, B]) if (S.uid) notifyProfile(S.uid); },
+    (e) => console.error('[db] challenge save failed:', e.message),
+  );
 }
 
 function resolvePicks(ch) {
@@ -233,12 +311,17 @@ function onSoloResult(ws, me, msg) {
   if (!EXERCISES.has(msg.exercise) || !DURATIONS.has(msg.durationS)) return;
   const scores = repScoresFrom(msg.repScores, msg.durationS);
   if (!scores) return;
-  saveWorkout({
-    mode: 'solo', exercise: msg.exercise, duration_s: msg.durationS,
-    user_id: me.userId, user_name: me.name, score: totalScore(scores), reps: scores.length,
-    avg_form: avgForm(scores), rep_scores: scores, forfeit: false,
+  // BP only for a set that really took its full length since the workout began, and once per workout.
+  const earn = me.soloSince !== null && Date.now() - me.soloSince >= msg.durationS * 1000 - 2000;
+  me.soloSince = null;
+  recordSolo({
+    uid: me.uid, secret: me.userId, name: me.name, exercise: msg.exercise, durationS: msg.durationS,
+    scores, score: totalScore(scores), avgForm: avgForm(scores), earn,
   }).then(
-    (stored) => send(ws, { type: 'saved', ok: stored, reason: stored ? undefined : 'no-db' }),
+    ({ stored, bpAwarded, bp }) => {
+      send(ws, { type: 'saved', ok: stored, reason: stored ? undefined : 'no-db', bpAwarded, bp });
+      if (stored && me.uid) notifyProfile(me.uid);
+    },
     (e) => {
       console.error('[db] solo save failed:', e.message);
       send(ws, { type: 'saved', ok: false, reason: 'error' });
@@ -262,17 +345,24 @@ wss.on('connection', (ws) => {
       const name = typeof msg.name === 'string' ? msg.name.trim().slice(0, 24) : '';
       const userId = typeof msg.userId === 'string' && msg.userId.length >= 4 && msg.userId.length <= 64 ? msg.userId : msg.id;
       const prev = players.get(ws);
-      players.set(ws, {
+      const same = prev?.userId === userId;
+      const entry = {
         id: msg.id,
         userId,
-        name: name || 'Player',
+        uid: same ? prev.uid : null,
+        username: same ? prev.username : null,
+        name: (same && prev.username) || name || 'Player',
         shirt: typeof msg.shirt === 'string' && HEX.test(msg.shirt) ? msg.shirt : '#7fb0e0',
+        equipped: same ? prev.equipped : {},
         lat: prev?.lat ?? null, lng: prev?.lng ?? null, heading: prev?.heading ?? null, acc: prev?.acc ?? null,
         ts: Date.now(),
         soloBusy: prev?.soloBusy ?? false,
-      });
+        soloSince: prev?.soloSince ?? null,
+      };
+      players.set(ws, entry);
       ws.send(JSON.stringify({ type: 'you', id: msg.id }));
       dirty = true;
+      if (hasDb()) void resolveAccount(ws, entry);
       return;
     }
 
@@ -292,7 +382,9 @@ wss.on('connection', (ws) => {
     }
 
     if (msg.type === 'status') {
-      me.soloBusy = msg.busy === true; // in a solo workout: refuse challenges
+      const busy = msg.busy === true; // in a solo workout: refuse challenges
+      if (busy && !me.soloBusy) me.soloSince = Date.now();
+      me.soloBusy = busy;
       dirty = true;
       return;
     }
@@ -323,7 +415,8 @@ setInterval(() => {
   for (const [ws, p] of players) {
     if (p.lat === null) continue;
     list.push({
-      id: p.id, name: p.name, shirt: p.shirt, lat: p.lat, lng: p.lng, heading: p.heading, acc: p.acc, ts: p.ts,
+      id: p.id, name: p.name, username: p.username, shirt: p.shirt, equipped: p.equipped,
+      lat: p.lat, lng: p.lng, heading: p.heading, acc: p.acc, ts: p.ts,
       busy: p.soloBusy || challengeOf.has(ws),
     });
   }

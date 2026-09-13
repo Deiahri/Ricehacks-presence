@@ -3,10 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Tiny WebSocket relay that shares each connected player's live position with everyone else.",
+  "description": "Presence relay, battle referee and account/friends/shop API for the Ricehacks PWA.",
   "scripts": {
     "start": "node server.mjs",
-    "walker": "node fake-walker.mjs"
+    "walker": "node fake-walker.mjs",
+    "coach:agent": "node --env-file=.env scripts/coach-agent.mjs",
+    "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
     "pg": "8.23.0",
